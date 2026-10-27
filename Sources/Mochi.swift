@@ -1,6 +1,6 @@
-// Mochi: a little pixel goo that floats at the bottom of your screen and talks to Claude Code in Terminal.
-// Type into her to send a message to Claude; she shows Claude's replies, questions and progress.
-// Type, press Return, and the message is pasted into whichever Terminal tab is in front (where Claude Code is running),
+// Mochi: a little pixel goo that floats at the bottom of your screen and talks to a selected CLI in Terminal.
+// Type into her to send a message; Claude Code also supplies replies, questions and progress through its hooks.
+// Type, press Return, and the message is sent to a verified Terminal tab for the selected provider,
 // then you're put back in the app you were using. Right-click the bar to quit.
 import Cocoa
 import ServiceManagement
@@ -44,6 +44,210 @@ func hex(_ s: String) -> NSColor {
 
 let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Mochi")
 let cyanText = NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9)
+
+enum ProviderID: String, CaseIterable {
+    case claude, codex
+
+    var adapter: ProviderAdapter {
+        switch self {
+        case .claude: return ClaudeProvider()
+        case .codex: return CodexProvider()
+        }
+    }
+}
+
+protocol ProviderAdapter {
+    var name: String { get }
+    var executable: String { get }
+    func matchesProcess(_ command: String) -> Bool
+}
+
+private func commandStarts(_ command: String, with executable: String) -> Bool {
+    guard let first = command.split(whereSeparator: \.isWhitespace).first else { return false }
+    return (first as NSString).lastPathComponent == executable
+}
+
+struct ClaudeProvider: ProviderAdapter {
+    let name = "Claude Code"
+    let executable = "claude"
+    func matchesProcess(_ command: String) -> Bool {
+        guard !command.contains("bg-spare") else { return false }
+        if commandStarts(command, with: executable) { return true }
+        let parts = command.split(whereSeparator: \.isWhitespace)
+        return parts.count > 1 && (parts[0] as NSString).lastPathComponent == "node"
+            && (parts[1] as NSString).lastPathComponent == executable
+    }
+}
+
+struct CodexProvider: ProviderAdapter {
+    let name = "Codex CLI"
+    let executable = "codex"
+    func matchesProcess(_ command: String) -> Bool { commandStarts(command, with: executable) }
+}
+
+// Read-only Codex history connection. Never sends a turn or resumes a thread.
+private final class CodexHistoryClient {
+    enum Failure: LocalizedError {
+        case unavailable(String)
+        var errorDescription: String? { if case .unavailable(let message) = self { return message }; return nil }
+    }
+
+    struct Thread {
+        let id: String, title: String, cwd: String, source: String, status: String
+        let local: Bool
+
+        init?(_ value: [String: Any]) {
+            guard let id = value["id"] as? String, let cwd = value["cwd"] as? String,
+                  let status = value["status"] as? [String: Any], let state = status["type"] as? String else { return nil }
+            self.id = id; self.cwd = cwd; self.status = state
+            let name = (value["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let preview = (value["preview"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            title = String((name?.isEmpty == false ? name : preview) ?? "Untitled").prefix(100).description
+            if let s = value["source"] as? String { source = s }
+            else if let s = value["source"] as? [String: Any], let custom = s["custom"] as? String { source = custom }
+            else { source = "unknown" }
+            local = UUID(uuidString: id) != nil && cwd.hasPrefix("/") &&
+                ["cli", "vscode", "appServer"].contains(source) && (value["ephemeral"] as? Bool) != true
+        }
+    }
+
+    private let process = Process()
+    private let input = Pipe(), output = Pipe()
+    private var buffer = Data()
+    private var nextID = 1
+    private var pending: [Int: (Result<[String: Any], Error>) -> Void] = [:]
+    private var stopped = false
+
+    init(executable: String) {
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["app-server", "--stdio"]
+        process.standardInput = input; process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+    }
+
+    func connect(_ done: @escaping (Result<Void, Error>) -> Void) {
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            DispatchQueue.main.async { self?.receive(data) }
+        }
+        process.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.failAll("Codex App Server exited. Its local state or permissions may be unavailable.") }
+        }
+        do { try process.run() } catch {
+            stop(); done(.failure(Failure.unavailable("Could not start Codex App Server: \(error.localizedDescription)"))); return
+        }
+        request("initialize", ["clientInfo": ["name": "katescape_history", "title": "Katescape History", "version": "0.1"]]) { [weak self] result in
+            switch result {
+            case .failure(let error): done(.failure(error))
+            case .success:
+                self?.notify("initialized", [:])
+                done(.success(()))
+            }
+        }
+    }
+
+    func request(_ method: String, _ params: [String: Any], timeout: TimeInterval = 8,
+                 _ done: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard !stopped, process.isRunning else {
+            done(.failure(Failure.unavailable("Codex App Server is unavailable"))); return
+        }
+        let id = nextID; nextID += 1
+        pending[id] = done
+        send(["method": method, "id": id, "params": params])
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self, let callback = self.pending.removeValue(forKey: id) else { return }
+            callback(.failure(Failure.unavailable("Codex App Server timed out during \(method)")))
+            self.stop()
+        }
+    }
+
+    private func notify(_ method: String, _ params: [String: Any]) {
+        send(["method": method, "params": params])
+    }
+
+    private func send(_ message: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(message),
+              var data = try? JSONSerialization.data(withJSONObject: message) else {
+            failAll("Could not encode Codex protocol request"); return
+        }
+        data.append(10)
+        do { try input.fileHandleForWriting.write(contentsOf: data) }
+        catch { failAll("Could not write to Codex App Server") }
+    }
+
+    private func receive(_ data: Data) {
+        guard !stopped else { return }
+        if data.isEmpty { failAll("Codex App Server closed its output"); return }
+        buffer.append(data)
+        guard buffer.count <= 4_000_000 else { failAll("Codex App Server response exceeded the size limit"); return }
+        while let end = buffer.firstIndex(of: 10) {
+            let line = Data(buffer[..<end]); buffer.removeSubrange(...end)
+            guard let value = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                failAll("Codex App Server returned malformed JSON"); return
+            }
+            if value["id"] == nil { continue } // documented notifications
+            guard let id = value["id"] as? Int else {
+                failAll("Codex App Server returned an invalid response ID"); return
+            }
+            guard let callback = pending.removeValue(forKey: id) else { continue }
+            if let error = value["error"] as? [String: Any] {
+                let message = error["message"] as? String ?? "Unknown protocol error"
+                callback(.failure(Failure.unavailable("Codex App Server: \(String(message.prefix(200)))")))
+            } else if let result = value["result"] as? [String: Any] {
+                callback(.success(result))
+            } else {
+                callback(.failure(Failure.unavailable("Codex App Server returned an invalid response")))
+            }
+        }
+    }
+
+    private func failAll(_ message: String) {
+        guard !stopped else { return }
+        let callbacks = pending.values; pending.removeAll()
+        stop()
+        for callback in callbacks { callback(.failure(Failure.unavailable(message))) }
+    }
+
+    func stop() {
+        guard !stopped else { return }
+        stopped = true
+        output.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning { process.terminate() }
+        try? input.fileHandleForWriting.close()
+    }
+
+    deinit { stop() }
+}
+
+private final class CodexThreadPickerView: NSView {
+    let popup = NSPopUpButton(frame: NSRect(x: 0, y: 60, width: 600, height: 28))
+    private let details = NSTextField(wrappingLabelWithString: "")
+    let threads: [CodexHistoryClient.Thread]
+
+    init(threads: [CodexHistoryClient.Thread]) {
+        self.threads = threads
+        super.init(frame: NSRect(x: 0, y: 0, width: 600, height: 90))
+        popup.addItems(withTitles: threads.map { $0.title })
+        popup.target = self; popup.action = #selector(updateDetails)
+        addSubview(popup)
+        details.frame = NSRect(x: 0, y: 0, width: 600, height: 56)
+        details.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        addSubview(details)
+        updateDetails()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    var selected: CodexHistoryClient.Thread? {
+        let index = popup.indexOfSelectedItem
+        return threads.indices.contains(index) ? threads[index] : nil
+    }
+
+    @objc private func updateDetails() {
+        guard let thread = selected else { return }
+        details.stringValue = "ID: \(thread.id)\nDirectory: \(thread.cwd)\nSource: \(thread.source) · Status: \(thread.status)"
+    }
+}
 
 // a button that works on the first click, even when Mochi isn't the active app
 final class Tap: NSButton { override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true } }
@@ -563,6 +767,10 @@ final class Wave: NSView {
 }
 
 final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
+    var provider = ProviderID(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .claude
+    var pillProviderMenu: NSMenu?
+    private var historyClient: CodexHistoryClient?
+    private var discoveredThreads: [CodexHistoryClient.Thread] = []
     var panel: Panel!
     var field: Field!
     var status: NSTextField!
@@ -703,7 +911,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         field.delegate = self
         glass.addSubview(field)
 
-        status = NSTextField(labelWithString: "→ Terminal")
+        status = NSTextField(labelWithString: "→ \(provider.adapter.name)")
         status.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
         status.textColor = NSColor(white: 1, alpha: 0.6); status.alignment = .right
         status.frame = NSRect(x: W - 2 - 152, y: (H - 2 - 14)/2, width: 132, height: 14)
@@ -717,6 +925,13 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         ring.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(tapped(_:))))
 
         let menu = NSMenu()
+        let providerItem = NSMenuItem(title: "Provider", action: nil, keyEquivalent: "")
+        let providerMenu = makeProviderMenu()
+        providerItem.submenu = providerMenu; pillProviderMenu = providerMenu
+        menu.addItem(providerItem)
+        let browse = NSMenuItem(title: "Browse Codex Threads…", action: #selector(browseCodexThreads), keyEquivalent: "")
+        browse.target = self; menu.addItem(browse)
+        menu.addItem(.separator())
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login); menu.addItem(.separator())
@@ -790,9 +1005,200 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         item(n > 0 ? "To-do list (\(n))" : "To-do list", #selector(openTodoFromMenu))
         item(panel.isVisible ? "Hide Mochi" : "Show Mochi", #selector(toggleShown))
         m.addItem(.separator())
+        let providerItem = NSMenuItem(title: "Provider", action: nil, keyEquivalent: "")
+        providerItem.submenu = makeProviderMenu(); m.addItem(providerItem)
+        item("Browse Codex Threads…", #selector(browseCodexThreads))
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off; m.addItem(login)
         m.addItem(withTitle: "Quit Mochi", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    func makeProviderMenu() -> NSMenu {
+        let menu = NSMenu()
+        for id in ProviderID.allCases {
+            let item = NSMenuItem(title: id.adapter.name, action: #selector(selectProvider(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = id.rawValue; item.state = id == provider ? .on : .off
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc func selectProvider(_ item: NSMenuItem) {
+        guard let raw = item.representedObject as? String, let next = ProviderID(rawValue: raw), next != provider else { return }
+        provider = next
+        UserDefaults.standard.set(next.rawValue, forKey: "provider")
+        pillProviderMenu?.items.forEach { $0.state = ($0.representedObject as? String) == next.rawValue ? .on : .off }
+        answeringOther = false; resetPlaceholder()
+        dot.thinking = false; dot.asking = false
+        meterText = ""; meter.stringValue = ""
+        nowText = ""; showStep("")
+        qData = nil; hideQuestion(); hideBubble()
+        progressSeen = ""; lastSeen = modified()
+        if next == .claude {
+            qShownId = ""
+            if let data = try? Data(contentsOf: questionFile),
+               let question = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               Date().timeIntervalSince1970 - (question["time"] as? Double ?? 0) > 1800 {
+                qShownId = question["id"] as? String ?? ""
+            }
+        }
+        status.stringValue = "→ \(next.adapter.name)"
+        if !open { fitCollapsed() }; lay()
+    }
+
+    // A separate, consented history surface. It never changes the Terminal destination.
+    @objc func browseCodexThreads() {
+        if !UserDefaults.standard.bool(forKey: "codexHistoryConsent") {
+            let alert = NSAlert()
+            alert.messageText = "Browse local Codex threads?"
+            alert.informativeText = "Katescape will start its own local Codex App Server connection and read thread titles, directories and selected transcript text. It will not resume a thread or send a message. Thread data stays in memory."
+            alert.addButton(withTitle: "Allow browsing")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            UserDefaults.standard.set(true, forKey: "codexHistoryConsent")
+        }
+        historyClient?.stop(); historyClient = nil; discoveredThreads = []
+        guard let executable = executablePath(for: CodexProvider()) else {
+            historyError("Codex CLI is unavailable. Install it separately before browsing threads."); return
+        }
+        let client = CodexHistoryClient(executable: executable)
+        historyClient = client
+        flash("reading Codex threads…", false)
+        client.connect { [weak self, weak client] result in
+            guard let self, let client, self.historyClient === client else { return }
+            if case .failure(let error) = result { self.historyError(error.localizedDescription); return }
+            client.request("account/read", ["refreshToken": false]) { [weak self, weak client] result in
+                guard let self, let client, self.historyClient === client else { return }
+                switch result {
+                case .failure(let error): self.historyError(error.localizedDescription)
+                case .success(let response):
+                    guard let requiresAuth = response["requiresOpenaiAuth"] as? Bool,
+                          response.keys.contains("account") else {
+                        self.historyError("This Codex version returned an unsupported account response."); return
+                    }
+                    if requiresAuth &&
+                        (response["account"] == nil || response["account"] is NSNull) {
+                        self.historyError("Codex sign-in is unavailable. Sign in using Codex, then try again.")
+                    } else { self.loadCodexThreads(client, cursor: nil, page: 0, seen: []) }
+                }
+            }
+        }
+    }
+
+    private func loadCodexThreads(_ client: CodexHistoryClient, cursor: String?, page: Int, seen: Set<String>) {
+        var params: [String: Any] = ["limit": 25, "useStateDbOnly": true,
+            "sourceKinds": ["cli", "vscode", "appServer", "unknown"], "sortKey": "updated_at"]
+        if let cursor { params["cursor"] = cursor }
+        client.request("thread/list", params) { [weak self, weak client] result in
+            guard let self, let client, self.historyClient === client else { return }
+            switch result {
+            case .failure(let error): self.historyError(error.localizedDescription)
+            case .success(let response):
+                guard let values = response["data"] as? [[String: Any]] else {
+                    self.historyError("This Codex version returned an unsupported thread list response."); return
+                }
+                let parsed = values.compactMap(CodexHistoryClient.Thread.init)
+                guard parsed.count == values.count else {
+                    self.historyError("Codex returned thread metadata Katescape cannot safely display."); return
+                }
+                self.discoveredThreads.append(contentsOf: parsed)
+                if let next = response["nextCursor"] as? String, !next.isEmpty, page < 3, !seen.contains(next) {
+                    self.loadCodexThreads(client, cursor: next, page: page + 1, seen: seen.union([next]))
+                } else { self.showCodexThreadPicker(client) }
+            }
+        }
+    }
+
+    private func showCodexThreadPicker(_ client: CodexHistoryClient) {
+        guard historyClient === client else { return }
+        guard !discoveredThreads.isEmpty else {
+            historyError("No local Codex threads were returned for this account, host and source filter."); return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Local Codex threads"
+        alert.informativeText = "Showing up to 100 local threads. Choose one to read its latest 8 turns."
+        let picker = CodexThreadPickerView(threads: discoveredThreads)
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "View selected")
+        alert.addButton(withTitle: "Close")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            guard let selected = picker.selected else { historyError("No thread was selected."); return }
+            readCodexThread(client, selected)
+        } else { client.stop(); historyClient = nil; discoveredThreads = [] }
+    }
+
+    private func readCodexThread(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread) {
+        client.request("thread/read", ["threadId": thread.id]) { [weak self, weak client] result in
+            guard let self, let client, self.historyClient === client else { return }
+            switch result {
+            case .failure(let error): self.historyError(error.localizedDescription)
+            case .success(let response):
+                guard let value = response["thread"] as? [String: Any], value["id"] as? String == thread.id else {
+                    self.historyError("Codex could not confirm the selected thread."); return
+                }
+                client.request("thread/turns/list", ["threadId": thread.id, "limit": 8,
+                    "sortDirection": "desc", "itemsView": "full"]) { [weak self, weak client] result in
+                    guard let self, let client, self.historyClient === client else { return }
+                    switch result {
+                    case .failure(let error):
+                        self.showCodexTranscript(client, thread, turns: [], note: "Transcript unavailable: \(error.localizedDescription)")
+                    case .success(let response):
+                        guard let turns = response["data"] as? [[String: Any]] else {
+                            self.showCodexTranscript(client, thread, turns: [], note: "Codex returned an unsupported transcript response."); return
+                        }
+                        self.showCodexTranscript(client, thread, turns: turns)
+                    }
+                }
+            }
+        }
+    }
+
+    private func showCodexTranscript(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread,
+                                     turns: [[String: Any]], note: String? = nil) {
+        var lines: [String] = []
+        for turn in turns.reversed() {
+            guard let items = turn["items"] as? [[String: Any]] else { continue }
+            for item in items {
+                if item["type"] as? String == "userMessage", let content = item["content"] as? [[String: Any]] {
+                    let text = content.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                    if !text.isEmpty { lines.append("YOU: " + String(text.prefix(500))) }
+                } else if item["type"] as? String == "agentMessage", let text = item["text"] as? String,
+                          !text.isEmpty { lines.append("CODEX: " + String(text.prefix(500))) }
+            }
+        }
+        let body = note ?? (lines.isEmpty ? "No text messages in the latest 8 turns." : lines.joined(separator: "\n\n"))
+        let alert = NSAlert()
+        alert.messageText = thread.title
+        alert.informativeText = "ID: \(thread.id)\nDirectory: \(thread.cwd)\nSource: \(thread.source) · Status: \(thread.status)\nLatest 8 turns only"
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 580, height: 300))
+        scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        let view = NSTextView(frame: scroll.bounds)
+        view.string = String(body.prefix(8_000)); view.isEditable = false; view.isSelectable = true
+        view.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        scroll.documentView = view; alert.accessoryView = scroll
+        if thread.local { alert.addButton(withTitle: "Open in Codex") }
+        alert.addButton(withTitle: "Back to threads")
+        NSApp.activate(ignoringOtherApps: true)
+        let choice = alert.runModal()
+        if thread.local && choice == .alertFirstButtonReturn {
+            guard let url = URL(string: "codex://threads/\(thread.id)"),
+                  NSWorkspace.shared.open(url) else {
+                historyError("Codex Desktop could not open this local thread."); return
+            }
+            client.stop(); historyClient = nil; discoveredThreads = []
+        } else { showCodexThreadPicker(client) }
+    }
+
+    private func historyError(_ message: String) {
+        historyClient?.stop(); historyClient = nil; discoveredThreads = []
+        let alert = NSAlert()
+        alert.messageText = "Codex threads unavailable"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     // bring the pill to the bottom middle of the screen you're on, and say hi
@@ -1043,6 +1449,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     }
 
     func checkReply() {
+        if provider == .codex { checkTodosAndNudge(); return }
         // thinking: a prompt went in after the last reply came out (and not too long ago)
         let wm = (try? FileManager.default.attributesOfItem(atPath: workFile.path))?[.modificationDate] as? Date
         let lm = modified()
@@ -1080,7 +1487,19 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             if id != qShownId { qShownId = id; qData = j; qIndex = 0; showQuestion() }
         } else if qPanel?.isVisible == true { hideQuestion() }
 
-        // the to-do list changed on disk (Claude added something)
+        checkTodosAndNudge()
+
+        guard let m = lm, m != lastSeen else { return }
+        lastSeen = m
+        guard let data = try? Data(contentsOf: lastFile),
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let text = j["text"] as? String, !text.isEmpty else { return }
+        progressSeen = ""
+        showBubble(text, project: j["project"] as? String ?? "", full: j["full"] as? String)
+    }
+
+    func checkTodosAndNudge() {
+        // the to-do list changed on disk (Claude may have added something)
         let tm = (try? FileManager.default.attributesOfItem(atPath: todoFile.path))?[.modificationDate] as? Date
         if tm != todoMTime { reloadTodos(announce: true) }
 
@@ -1091,13 +1510,6 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             showBubble("good morning! ☕ \(open_) thing\(open_ == 1 ? "" : "s") on your to-do list. Click the checklist to see.", project: "to-do", react: false); dot.hop()
         }
 
-        guard let m = lm, m != lastSeen else { return }
-        lastSeen = m
-        guard let data = try? Data(contentsOf: lastFile),
-              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let text = j["text"] as? String, !text.isEmpty else { return }
-        progressSeen = ""
-        showBubble(text, project: j["project"] as? String ?? "", full: j["full"] as? String)
     }
 
     func showBubble(_ text: String, project: String, react: Bool = true, full: String? = nil) {
@@ -1243,7 +1655,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         status.stringValue = s; status.textColor = c
         mini.stringValue = s; mini.textColor = c; mini.sizeToFit(); fitCollapsed(); lay(); mini.needsDisplay = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            self.status.stringValue = "→ Terminal"; self.status.textColor = NSColor(white: 1, alpha: 0.6)
+            self.status.stringValue = "→ \(self.provider.adapter.name)"; self.status.textColor = NSColor(white: 1, alpha: 0.6)
             self.mini.stringValue = "Mochi"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.fitCollapsed(); self.lay()
         }
     }
@@ -1260,10 +1672,25 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     func send() {
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
-        if answeringOther { answeringOther = false; resetPlaceholder(); field.stringValue = ""; setOpen(false); answer(nil, other: text); return }
+        if answeringOther && provider == .claude { answer(nil, other: text); return }
         if handleTodo(text) { return }
         sending = true
-        // find a Terminal tab running Claude: the front one, any other, or start one
+        let selected = provider
+        let adapter = selected.adapter
+        // A GUI app may have a smaller PATH than Terminal. An existing session is still usable
+        // when the executable is not visible from Mochi's PATH.
+        let live = providerTTYs(selected)
+        let tabs = terminalTTYs()
+        guard let availableTabs = tabs else { sendFailure("Cannot inspect Terminal tabs. Allow Automation for Mochi."); return }
+        let candidates = live.intersection(availableTabs)
+        if candidates.isEmpty {
+            if executablePath(for: adapter) == nil { sendFailure("\(adapter.name) CLI not found"); return }
+            sendFailure("No active \(adapter.name) session in Terminal; start one there first"); return
+        }
+        if selected == .codex {
+            guard executablePath(for: adapter) != nil else { sendFailure("Codex CLI executable unavailable to Katescape; draft kept"); return }
+            guard codexAuthenticated() else { sendFailure("Codex sign-in unavailable; run codex login in Terminal"); return }
+        }
         let front = run("""
         if application "Terminal" is not running then return ""
         tell application "Terminal"
@@ -1272,14 +1699,31 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         end tell
         """)
         if let e = front.err { failed(e); return }
-        let live = claudeTTYs()
-        if live.contains(front.out) { paste(text); return }
-        if let tty = live.first {
-            // Claude is running in another tab: bring that tab forward
-            if let e = focusTTY(tty) { failed(e); return }
-            paste(text); return
+        let tty: String
+        if candidates.contains(front.out) { tty = front.out }
+        else if candidates.count == 1 { tty = candidates.first! }
+        else {
+            guard let choice = chooseSession(candidates.sorted(), provider: adapter.name) else { sending = false; return }
+            tty = choice
         }
-        wake(then: text)
+        guard provider == selected, providerTTYs(selected).contains(tty), terminalTTYs()?.contains(tty) == true else {
+            sendFailure("\(adapter.name) session changed; try again"); return
+        }
+        if let e = focusTTY(tty) { failed(e); return }
+        paste(text, to: tty, provider: selected)
+    }
+
+    func chooseSession(_ ttys: [String], provider name: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = "Choose a \(name) Terminal session"
+        alert.informativeText = "Several sessions are running. Run tty in a tab if you need to identify it. Your draft stays in Mochi if you cancel."
+        alert.addButton(withTitle: "Send to selected session")
+        alert.addButton(withTitle: "Cancel")
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        picker.addItems(withTitles: ttys)
+        alert.accessoryView = picker
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn ? picker.titleOfSelectedItem : nil
     }
 
     // bring the Terminal tab on a given tty to the front
@@ -1337,7 +1781,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             let openList = todos.enumerated().filter { $0.element.done == nil }
             let hit = Int(what).flatMap { n in n >= 1 && n <= openList.count ? openList[n - 1].offset : nil }
                 ?? openList.first { $0.element.text.lowercased().contains(what.lowercased()) }?.offset
-            guard let i = hit else { return false }   // not on the list: it's a message for Claude
+            guard let i = hit else { return false }   // not on the list: send it to the selected provider
             todos[i].done = Date().timeIntervalSince1970; saveTodosNow()
             done(); dot.proud()
             showBubble("checked off ✓  " + todos[i].text, project: "to-do", react: false)
@@ -1504,25 +1948,44 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     }
 
     @objc func openQuestionTab() {
-        focusTTY(qData?["tty"] as? String ?? "")
+        guard provider == .claude, let tty = qData?["tty"] as? String,
+              providerTTYs(.claude).contains(tty), terminalTTYs()?.contains(tty) == true else {
+            sendFailure("Claude session unavailable; question left open"); return
+        }
+        if let e = focusTTY(tty) { failed(e); return }
         _ = run("tell application \"Terminal\" to activate")
     }
 
     // answer in Claude's Terminal tab: arrow down to the option and press Return ("Other" sits after the options, then the typed answer)
     func answer(_ i: Int?, other: String? = nil) {
-        guard let j = qData, let qs = j["questions"] as? [[String: Any]], qIndex < qs.count else { return }
+        guard provider == .claude, let j = qData, let tty = j["tty"] as? String,
+              providerTTYs(.claude).contains(tty), terminalTTYs()?.contains(tty) == true,
+              let qs = j["questions"] as? [[String: Any]], qIndex < qs.count else {
+            sendFailure("Claude question session unavailable; answer kept"); return
+        }
         let n = (qs[qIndex]["options"] as? [[String: Any]])?.count ?? 0
         let back = lastApp
-        if let e = focusTTY(j["tty"] as? String ?? "") { failed(e); return }
-        let pb = NSPasteboard.general, saved = pb.string(forType: .string)
-        if let o = other { pb.clearContents(); pb.setString(o, forType: .string) }
+        if let e = focusTTY(tty) { failed(e); return }
+        let pb = NSPasteboard.general, saved = other == nil ? [] : clipboardItems(pb)
+        if let o = other {
+            pb.clearContents()
+            guard pb.setString(o, forType: .string) else {
+                restoreClipboard(pb, items: saved, ifUnchanged: pb.changeCount)
+                sendFailure("Clipboard unavailable; answer kept"); return
+            }
+        }
+        let mine = pb.changeCount
         // Claude's question menu is numbered: typing the option's number picks it ("Other" is the number after the options)
-        var sc = "tell application \"Terminal\" to activate\ntell application \"System Events\"\nrepeat 30 times\nif frontmost of process \"Terminal\" then exit repeat\ndelay 0.04\nend repeat\ndelay 0.2\n"
+        var sc = "tell application \"Terminal\" to activate\ndelay 0.2\ntell application \"Terminal\"\nif (tty of selected tab of front window) is not \"\(tty)\" then error \"Terminal tab changed\" number -10000\nend tell\ntell application \"System Events\"\nif not (frontmost of process \"Terminal\") then error \"Terminal is not frontmost\" number -10000\n"
         sc += "keystroke \"\((i ?? n) + 1)\"\n"
         if other != nil { sc += "delay 0.35\nkeystroke \"v\" using command down\ndelay 0.25\nkey code 36\n" }
         sc += "end tell"
         let r = run(sc)
-        if let e = r.err { failed(e); return }
+        if let e = r.err {
+            if other != nil { restoreClipboard(pb, items: saved, ifUnchanged: mine) }
+            failed(e); return
+        }
+        if other != nil { answeringOther = false; resetPlaceholder(); field.stringValue = ""; setOpen(false) }
         let t0 = Date()
         qIndex += 1
         if qIndex < qs.count {
@@ -1532,7 +1995,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             hideQuestion(); flash("answered ✓"); dot.proud()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-            if other != nil { pb.clearContents(); if let s = saved { pb.setString(s, forType: .string) } }
+            if other != nil { self.restoreClipboard(pb, items: saved, ifUnchanged: mine) }
             self.handBack(back, since: t0)
         }
     }
@@ -1573,50 +2036,75 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         NSAnimationContext.runAnimationGroup({ c in c.duration = 0.25; p.animator().alphaValue = 0 }, completionHandler: { [weak self] in p.orderOut(nil); self?.repositionPanels() })
     }
 
-    // no Claude running anywhere: open Terminal, run claude --continue, wait for it, then send
-    func wake(then text: String) {
-        status.stringValue = "waking Claude…"; status.textColor = NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9)
-        field.isEditable = false
-        dot.hop()
-        let r = run("""
-        tell application "Terminal"
-            activate
-            set t to do script "claude --continue"
-            return tty of t
-        end tell
-        """)
-        if let e = r.err { field.isEditable = true; failed(e); return }
-        let tty = r.out
-        var tries = 0
-        func check() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                tries += 1
-                if self.claudeTTYs().contains(tty) {
-                    // it's up: give it a moment to draw its prompt, then send
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.field.isEditable = true; self.paste(text) }
-                } else if tries < 40 { check() }
-                else { self.field.isEditable = true; self.sending = false; self.dot.worry(); self.flash("couldn't wake Claude", false) }
-            }
-        }
-        check()
-    }
-
-    // the terminals (like /dev/ttys002) that have a Claude Code session running in them
-    func claudeTTYs() -> Set<String> {
+    // Only foreground CLI jobs are valid destinations; a stopped/background process
+    // sharing the TTY must not make a different prompt look safe.
+    func providerTTYs(_ id: ProviderID) -> Set<String> {
         let p = Process(), pipe = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axo", "tty=,command="]
+        p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axo", "tty=,stat=,command="]
         p.standardOutput = pipe
         guard (try? p.run()) != nil else { return [] }
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         p.waitUntilExit()
         var ttys = Set<String>()
         for line in out.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-            guard parts.count == 2, parts[0].hasPrefix("ttys") else { continue }
-            let cmd = parts[1].trimmingCharacters(in: .whitespaces)
-            if (cmd == "claude" || cmd.hasPrefix("claude ") || cmd.hasSuffix("/claude") || cmd.contains("/claude ")) && !cmd.contains("bg-spare") { ttys.insert("/dev/" + parts[0]) }
+            let parts = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+            guard parts.count == 3, parts[0].hasPrefix("ttys"), parts[1].contains("+") else { continue }
+            let cmd = parts[2].trimmingCharacters(in: .whitespaces)
+            if id.adapter.matchesProcess(cmd) { ttys.insert("/dev/" + parts[0]) }
         }
         return ttys
+    }
+
+    func terminalTTYs() -> Set<String>? {
+        let r = run("""
+        if application "Terminal" is not running then return ""
+        set outText to ""
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set outText to outText & (tty of t) & linefeed
+                end repeat
+            end repeat
+        end tell
+        return outText
+        """)
+        guard r.err == nil else { return nil }
+        return Set(r.out.split(separator: "\n").map(String.init))
+    }
+
+    func executablePath(for adapter: ProviderAdapter) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let directories = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map(String.init).filter { $0.hasPrefix("/") }
+            + [home + "/.local/bin", home + "/.npm-global/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+        var candidates = directories.map { ($0 as NSString).appendingPathComponent(adapter.executable) }
+        if adapter.executable == "codex" {
+            // Finder-launched apps often lack Terminal's PATH. ChatGPT Desktop ships a CLI
+            // that supports standalone commands, including login status and app-server.
+            let relative = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+            candidates += ["/Applications/ChatGPT.app/" + relative,
+                           home + "/Applications/ChatGPT.app/" + relative]
+        }
+        for candidate in candidates {
+            let path = URL(fileURLWithPath: candidate).resolvingSymlinksInPath().path
+            guard path.hasPrefix("/"),
+                  let type = (try? FileManager.default.attributesOfItem(atPath: path))?[.type] as? FileAttributeType,
+                  type == .typeRegular,
+                  FileManager.default.isExecutableFile(atPath: path) else { continue }
+            return path
+        }
+        return nil
+    }
+
+    func codexAuthenticated() -> Bool {
+        guard let path = executablePath(for: CodexProvider()) else { return false }
+        let p = Process(), signal = DispatchSemaphore(value: 0)
+        p.executableURL = URL(fileURLWithPath: path); p.arguments = ["login", "status"]
+        p.standardOutput = Pipe(); p.standardError = Pipe()
+        p.terminationHandler = { _ in signal.signal() }
+        guard (try? p.run()) != nil else { return false }
+        if signal.wait(timeout: .now() + 3) == .timedOut { p.terminate(); return false }
+        return p.terminationStatus == 0
     }
 
     func run(_ source: String) -> (out: String, err: NSDictionary?) {
@@ -1625,30 +2113,58 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         return (r?.stringValue ?? "", err)
     }
 
-    // put the message on the clipboard (keeping what was there), paste it into Terminal's front tab, press Return
-    func paste(_ text: String) {
+    func sendFailure(_ message: String) {
+        sending = false; field.isEditable = true; dot.worry(); flash(message, false)
+    }
+
+    func clipboardItems(_ pb: NSPasteboard) -> [NSPasteboardItem] {
+        (pb.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types { if let data = item.data(forType: type) { copy.setData(data, forType: type) } }
+            return copy
+        }
+    }
+
+    func restoreClipboard(_ pb: NSPasteboard, items: [NSPasteboardItem], ifUnchanged count: Int) {
+        guard pb.changeCount == count else { return }
+        pb.clearContents()
+        if !items.isEmpty { _ = pb.writeObjects(items) }
+    }
+
+    // Paste only into the verified tab. Keep the draft until AppleScript reports success.
+    func paste(_ text: String, to tty: String, provider id: ProviderID) {
         note("paste")
+        guard provider == id, providerTTYs(id).contains(tty), terminalTTYs()?.contains(tty) == true else {
+            sendFailure("\(id.adapter.name) session changed; draft kept"); return
+        }
         let back = lastApp
         let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
-        pb.clearContents(); pb.setString(text, forType: .string)
+        let saved = clipboardItems(pb)
+        pb.clearContents()
+        guard pb.setString(text, forType: .string) else {
+            restoreClipboard(pb, items: saved, ifUnchanged: pb.changeCount)
+            sendFailure("Clipboard unavailable; draft kept"); return
+        }
         let mine = pb.changeCount
         let r = run("""
         tell application "Terminal" to activate
         delay 0.25
+        tell application "Terminal"
+            if (count of windows) = 0 then error "Terminal session closed" number -10000
+            if (tty of selected tab of front window) is not "\(tty)" then error "Terminal tab changed" number -10000
+        end tell
         tell application "System Events"
+            if not (frontmost of process "Terminal") then error "Terminal is not frontmost" number -10000
             keystroke "v" using command down
             delay 0.25
             key code 36
         end tell
         """)
-        // put the old clipboard back only once Terminal has surely taken the paste (it can be slow), and only if nothing else changed it
+        if let e = r.err { restoreClipboard(pb, items: saved, ifUnchanged: mine); failed(e); return }
+        // Restore the clipboard only if no other app or user has changed it.
         let t0 = Date()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self.handBack(back, since: t0) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            if pb.changeCount == mine { pb.clearContents(); if let s = saved { pb.setString(s, forType: .string) } }
-        }
-        if let e = r.err { failed(e); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.restoreClipboard(pb, items: saved, ifUnchanged: mine) }
         field.stringValue = ""
         celebrateSend()
     }
@@ -1660,8 +2176,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         let line = "\(Date()) \(code) \(e[NSAppleScript.errorMessage] ?? "")\n"
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Mochi.log")
         if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile() } else { try? line.write(to: url, atomically: true, encoding: .utf8) }
-        dot.worry()
-        flash(code == -1743 ? "allow Automation" : (code == -1719 || code == 1002 || code == -25211) ? "allow Accessibility" : "error \(code)", false)
+        field.isEditable = true; dot.worry()
+        flash(code == -1743 ? "allow Terminal Automation; draft kept" :
+              (code == -1719 || code == 1002 || code == -25211) ? "allow Accessibility; draft kept" :
+              code == -10000 ? "Terminal session changed; draft kept" : "send failed (\(code)); draft kept", false)
     }
 
     func celebrateSend() {
