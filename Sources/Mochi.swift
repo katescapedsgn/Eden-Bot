@@ -1,8 +1,8 @@
-// Mochi: a little pixel goo that floats at the bottom of your screen and talks to a selected CLI in Terminal.
-// Type into her to send a message; Claude Code also supplies replies, questions and progress through its hooks.
-// Type, press Return, and the message is sent to a verified Terminal tab for the selected provider,
-// then you're put back in the app you were using. Right-click the bar to quit.
+// Katescape: a floating desktop pet for local app commands and optional CLI integrations.
+// Return handles app commands and local to-dos. Terminal messaging requires the Advanced menu.
+// Claude Code can still supply replies, questions and progress through its existing hooks.
 import Cocoa
+import CoreServices
 import ServiceManagement
 
 final class Panel: NSPanel {
@@ -45,6 +45,233 @@ func hex(_ s: String) -> NSColor {
 let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Mochi")
 let cyanText = NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9)
 
+enum LauncherCommand: Equatable {
+    case message
+    case browseCodexThreads
+    case open([String])
+    case invalidAppReference
+}
+
+struct LauncherCommandParser {
+    func parse(_ input: String) -> LauncherCommand {
+        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.hasSuffix("?") else { return .message }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: ".!"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = text.lowercased()
+        if lower == "show my codex conversations" || lower == "show codex conversations"
+            || lower == "show my codex threads" || lower == "show codex threads" {
+            return .browseCodexThreads
+        }
+        guard let match = lower.range(of: #"^(?:open|launch|start|switch to|show)\s+"#, options: .regularExpression) else {
+            return .message
+        }
+        let verb = lower[..<match.upperBound].trimmingCharacters(in: .whitespaces)
+        let body = String(text[match.upperBound...])
+        let separated = body.replacingOccurrences(of: #"\s+(?:and|&)\s+"#, with: ",", options: [.regularExpression, .caseInsensitive])
+        let parts = separated.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else { return .invalidAppReference }
+        for part in parts {
+            // The launcher takes names and bundle IDs only, never paths or URLs.
+            if part.contains("/") || part.contains(":") || part.hasPrefix("~") || part.hasPrefix(".") {
+                return .invalidAppReference
+            }
+        }
+        let first = parts[0].split(whereSeparator: \.isWhitespace).first?.lowercased() ?? ""
+        if parts.count == 1 {
+            if ["a", "an", "the", "my", "me", "your", "this", "that", "our", "some"].contains(first) {
+                return .message
+            }
+            if verb == "start" && parts[0].split(whereSeparator: \.isWhitespace).count == 1
+                && first.hasSuffix("ing") { return .message }
+        }
+        var unique: [String] = []
+        for part in parts where !unique.contains(where: { $0.caseInsensitiveCompare(part) == .orderedSame }) {
+            unique.append(part)
+        }
+        return .open(unique)
+    }
+}
+
+struct InstalledApplication: Hashable {
+    let url: URL
+    let displayName: String
+    let bundleName: String
+    let bundleID: String
+    let fileName: String
+
+    init?(url: URL) {
+        let location = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard location.pathExtension.lowercased() == "app",
+              let bundle = Bundle(url: location),
+              bundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String == "APPL",
+              let id = bundle.bundleIdentifier, !id.isEmpty else { return nil }
+        let fileName = location.deletingPathExtension().lastPathComponent
+        self.url = location
+        self.fileName = fileName
+        self.bundleID = id
+        self.bundleName = (bundle.infoDictionary?["CFBundleName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? fileName
+        self.displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            .flatMap { $0.isEmpty ? nil : $0 } ?? self.bundleName
+    }
+
+    var names: [String] { [displayName, bundleName, fileName] }
+}
+
+enum LauncherResolution: Equatable {
+    case exact([InstalledApplication])
+    case alias([InstalledApplication])
+    case suggestions([InstalledApplication])
+    case missing
+}
+
+struct LauncherAppResolver {
+    private enum AliasTarget {
+        case bundleID(String)
+        case namePrefix(String)
+    }
+    private static let aliases: [String: AliasTarget] = [
+        "codex": .bundleID("com.openai.codex"),
+        "chat gpt": .bundleID("com.openai.chat"),
+        "vs code": .bundleID("com.microsoft.VSCode"),
+        "vscode": .bundleID("com.microsoft.VSCode"),
+        "code": .bundleID("com.microsoft.VSCode"),
+        "chrome": .bundleID("com.google.Chrome"),
+        "photoshop": .namePrefix("adobe photoshop")
+    ]
+
+    static func normalized(_ text: String) -> String {
+        let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
+            .lowercased()
+        let words = folded.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? String($0) : " " }
+            .joined().split(whereSeparator: \.isWhitespace)
+        return words.joined(separator: " ")
+    }
+
+    static func aliasBundleID(for name: String) -> String? {
+        if case .bundleID(let id) = aliases[normalized(name)] { return id }
+        return nil
+    }
+
+    static func resolve(_ name: String, in apps: [InstalledApplication]) -> LauncherResolution {
+        let key = normalized(name)
+        guard !key.isEmpty else { return .missing }
+        let sorted = apps.sorted {
+            let order = $0.displayName.localizedStandardCompare($1.displayName)
+            return order == .orderedSame ? $0.url.path < $1.url.path : order == .orderedAscending
+        }
+        let exact = sorted.filter { app in
+            app.names.contains { normalized($0) == key } || normalized(app.bundleID) == key
+        }
+        if !exact.isEmpty { return .exact(exact) }
+        if let alias = aliases[key] {
+            let matches = sorted.filter { app in
+                switch alias {
+                case .bundleID(let id): return app.bundleID.caseInsensitiveCompare(id) == .orderedSame
+                case .namePrefix(let prefix): return app.names.contains { normalized($0).hasPrefix(prefix) }
+                }
+            }
+            if !matches.isEmpty { return .alias(matches) }
+        }
+        guard key.count >= 3 else { return .missing }
+        let suggestions = sorted.filter { app in
+            app.names.contains { candidate in
+                let candidate = normalized(candidate)
+                return candidate.contains(key) || (candidate.count <= 24 && key.count <= 24 &&
+                    editDistance(candidate, key, limit: 2) <= 2)
+            }
+        }
+        return suggestions.isEmpty ? .missing : .suggestions(Array(suggestions.prefix(12)))
+    }
+
+    private static func editDistance(_ left: String, _ right: String, limit: Int) -> Int {
+        let a = Array(left), b = Array(right)
+        if abs(a.count - b.count) > limit { return limit + 1 }
+        var row = Array(0...b.count)
+        for (i, x) in a.enumerated() {
+            var next = [i + 1] + Array(repeating: 0, count: b.count)
+            for (j, y) in b.enumerated() {
+                next[j + 1] = min(next[j] + 1, row[j + 1] + 1, row[j] + (x == y ? 0 : 1))
+            }
+            row = next
+        }
+        return row[b.count]
+    }
+}
+
+enum LauncherAppDiscovery {
+    static func sameLocation(_ left: URL, _ right: URL) -> Bool {
+        left.standardizedFileURL.resolvingSymlinksInPath() ==
+            right.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    static var standardRoots: [URL] {
+        [URL(fileURLWithPath: "/Applications", isDirectory: true),
+         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+         URL(fileURLWithPath: "/System/Applications", isDirectory: true)]
+    }
+
+    static func catalog(roots: [URL], registeredURLs: [URL]) -> [InstalledApplication] {
+        var paths = registeredURLs
+        for root in roots { scan(root, depth: 0, into: &paths) }
+        var found: [URL: InstalledApplication] = [:]
+        for path in paths {
+            if let app = InstalledApplication(url: path) { found[app.url] = app }
+        }
+        return Array(found.values)
+    }
+
+    private static func scan(_ folder: URL, depth: Int, into paths: inout [URL]) {
+        guard depth <= 2, let children = try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]) else { return }
+        for child in children {
+            if child.pathExtension.lowercased() == "app" { paths.append(child); continue }
+            guard depth < 2, (try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]))?.isDirectory == true,
+                  (try? child.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true else { continue }
+            scan(child, depth: depth + 1, into: &paths)
+        }
+    }
+
+    private static func spotlightURLs() -> [URL] {
+        guard let query = MDQueryCreate(kCFAllocatorDefault,
+            "kMDItemContentTypeTree == \"com.apple.application-bundle\"" as CFString, nil, nil) else { return [] }
+        guard MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue)) else {
+            MDQueryStop(query)
+            return []
+        }
+        defer { MDQueryStop(query) }
+        var paths: [URL] = []
+        for index in 0..<min(MDQueryGetResultCount(query), 10_000) {
+            guard let raw = MDQueryGetResultAtIndex(query, index) else { continue }
+            let item = unsafeBitCast(raw, to: MDItem.self)
+            if let path = MDItemCopyAttribute(item, kMDItemPath) as? String {
+                paths.append(URL(fileURLWithPath: path))
+            }
+        }
+        return paths
+    }
+
+    static func discover(names: [String], completion: @escaping ([InstalledApplication]) -> Void) {
+        let workspace = NSWorkspace.shared
+        var registered = workspace.runningApplications.compactMap(\.bundleURL)
+        for name in names {
+            // Launch Services can find a registered app outside the standard folders.
+            if let path = workspace.fullPath(forApplication: name) {
+                registered.append(URL(fileURLWithPath: path))
+            }
+            for id in [name, LauncherAppResolver.aliasBundleID(for: name)].compactMap({ $0 }) {
+                if let url = workspace.urlForApplication(withBundleIdentifier: id) { registered.append(url) }
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let apps = catalog(roots: standardRoots, registeredURLs: registered + spotlightURLs())
+            DispatchQueue.main.async { completion(apps) }
+        }
+    }
+}
+
 enum ProviderID: String, CaseIterable {
     case claude, codex
 
@@ -85,21 +312,76 @@ struct CodexProvider: ProviderAdapter {
     func matchesProcess(_ command: String) -> Bool { commandStarts(command, with: executable) }
 }
 
-// Read-only Codex history connection. Never sends a turn or resumes a thread.
+// Katescape-owned Codex App Server connection. History reads and explicitly selected turns only.
 private final class CodexHistoryClient {
     enum Failure: LocalizedError {
         case unavailable(String)
-        var errorDescription: String? { if case .unavailable(let message) = self { return message }; return nil }
+        case validation(String)
+        case rejected(Int?, String)
+        case timeout(String)
+        case exited(Int32)
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailable(let message): return message
+            case .validation(let message): return message
+            case .rejected(_, let message): return "Codex App Server: \(String(message.prefix(200)))"
+            case .timeout(let method): return "Codex App Server timed out during \(method)"
+            case .exited(let status): return "Codex App Server exited (status \(status))"
+            }
+        }
+
+        // Diagnostics never contain server-supplied text, which can include private data.
+        var safeSummary: String {
+            switch self {
+            case .unavailable: return "App Server transport or response unavailable"
+            case .validation(let message): return message
+            case .rejected(_, let message):
+                if let category = activeWorkCategory { return category }
+                let lower = message.lowercased()
+                if lower.contains("not found") { return "App Server reported not found" }
+                if lower.contains("permission") || lower.contains("access denied") {
+                    return "App Server reported a permission error"
+                }
+                if lower.contains("experimentalapi") { return "App Server reported an experimental API requirement" }
+                return "App Server rejected the request"
+            case .timeout: return "App Server request timed out"
+            case .exited: return "App Server process exited"
+            }
+        }
+
+        var rpcCode: Int? { if case .rejected(let code, _) = self { return code }; return nil }
+
+        var activeWorkCategory: String? {
+            guard case .rejected(let code, let message) = self, code == -32600 else { return nil }
+            let lower = message.lowercased()
+            if lower.contains("different rollout path") { return "Thread is running with a different rollout path" }
+            if lower.contains("active writer") { return "Thread has another active writer" }
+            if lower.contains("active turn") || lower.contains("turn is active") {
+                return "Thread has an active turn"
+            }
+            if lower.contains("already running") { return "Thread is already running" }
+            if lower.contains("already active") || lower.contains("active work") {
+                return "Thread has active work"
+            }
+            if lower.contains("already") && (lower.contains("running") || lower.contains("active")) {
+                return "Thread reports active work or ownership"
+            }
+            return nil
+        }
     }
 
     struct Thread {
         let id: String, title: String, cwd: String, source: String, status: String
+        let projectID: String?, modelProvider: String
         let local: Bool
 
         init?(_ value: [String: Any]) {
             guard let id = value["id"] as? String, let cwd = value["cwd"] as? String,
                   let status = value["status"] as? [String: Any], let state = status["type"] as? String else { return nil }
             self.id = id; self.cwd = cwd; self.status = state
+            projectID = value["projectId"] as? String
+            modelProvider = value["modelProvider"] as? String ?? ""
             let name = (value["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let preview = (value["preview"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             title = String((name?.isEmpty == false ? name : preview) ?? "Untitled").prefix(100).description
@@ -117,6 +399,9 @@ private final class CodexHistoryClient {
     private var nextID = 1
     private var pending: [Int: (Result<[String: Any], Error>) -> Void] = [:]
     private var stopped = false
+    var onNotification: ((String, [String: Any]) -> Void)?
+    var onServerRequest: ((Any, String, [String: Any]) -> Void)?
+    var onDisconnect: ((Failure) -> Void)?
 
     init(executable: String) {
         process.executableURL = URL(fileURLWithPath: executable)
@@ -130,8 +415,8 @@ private final class CodexHistoryClient {
             let data = handle.availableData
             DispatchQueue.main.async { self?.receive(data) }
         }
-        process.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async { self?.failAll("Codex App Server exited. Its local state or permissions may be unavailable.") }
+        process.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async { self?.failAll(.exited(process.terminationStatus)) }
         }
         do { try process.run() } catch {
             stop(); done(.failure(Failure.unavailable("Could not start Codex App Server: \(error.localizedDescription)"))); return
@@ -156,9 +441,17 @@ private final class CodexHistoryClient {
         send(["method": method, "id": id, "params": params])
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self, let callback = self.pending.removeValue(forKey: id) else { return }
-            callback(.failure(Failure.unavailable("Codex App Server timed out during \(method)")))
-            self.stop()
+            callback(.failure(Failure.timeout(method)))
+            self.failAll(.timeout(method))
         }
+    }
+
+    func respond(to id: Any, result: [String: Any]) {
+        send(["id": id, "result": result])
+    }
+
+    func reject(to id: Any, message: String) {
+        send(["id": id, "error": ["code": -32601, "message": message]])
     }
 
     private func notify(_ method: String, _ params: [String: Any]) {
@@ -168,31 +461,37 @@ private final class CodexHistoryClient {
     private func send(_ message: [String: Any]) {
         guard JSONSerialization.isValidJSONObject(message),
               var data = try? JSONSerialization.data(withJSONObject: message) else {
-            failAll("Could not encode Codex protocol request"); return
+            failAll(.unavailable("Could not encode Codex protocol request")); return
         }
         data.append(10)
         do { try input.fileHandleForWriting.write(contentsOf: data) }
-        catch { failAll("Could not write to Codex App Server") }
+        catch { failAll(.unavailable("Could not write to Codex App Server")) }
     }
 
     private func receive(_ data: Data) {
         guard !stopped else { return }
-        if data.isEmpty { failAll("Codex App Server closed its output"); return }
+        if data.isEmpty { failAll(.unavailable("Codex App Server closed its output")); return }
         buffer.append(data)
-        guard buffer.count <= 4_000_000 else { failAll("Codex App Server response exceeded the size limit"); return }
+        guard buffer.count <= 4_000_000 else { failAll(.unavailable("Codex App Server response exceeded the size limit")); return }
         while let end = buffer.firstIndex(of: 10) {
             let line = Data(buffer[..<end]); buffer.removeSubrange(...end)
             guard let value = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-                failAll("Codex App Server returned malformed JSON"); return
+                failAll(.unavailable("Codex App Server returned malformed JSON")); return
             }
-            if value["id"] == nil { continue } // documented notifications
+            if let method = value["method"] as? String {
+                let params = value["params"] as? [String: Any] ?? [:]
+                if let id = value["id"] { onServerRequest?(id, method, params) }
+                else { onNotification?(method, params) }
+                continue
+            }
+            if value["id"] == nil { continue }
             guard let id = value["id"] as? Int else {
-                failAll("Codex App Server returned an invalid response ID"); return
+                failAll(.unavailable("Codex App Server returned an invalid response ID")); return
             }
             guard let callback = pending.removeValue(forKey: id) else { continue }
             if let error = value["error"] as? [String: Any] {
                 let message = error["message"] as? String ?? "Unknown protocol error"
-                callback(.failure(Failure.unavailable("Codex App Server: \(String(message.prefix(200)))")))
+                callback(.failure(Failure.rejected(error["code"] as? Int, message)))
             } else if let result = value["result"] as? [String: Any] {
                 callback(.success(result))
             } else {
@@ -201,11 +500,12 @@ private final class CodexHistoryClient {
         }
     }
 
-    private func failAll(_ message: String) {
+    private func failAll(_ failure: Failure) {
         guard !stopped else { return }
         let callbacks = pending.values; pending.removeAll()
         stop()
-        for callback in callbacks { callback(.failure(Failure.unavailable(message))) }
+        for callback in callbacks { callback(.failure(failure)) }
+        onDisconnect?(failure)
     }
 
     func stop() {
@@ -217,6 +517,55 @@ private final class CodexHistoryClient {
     }
 
     deinit { stop() }
+}
+
+// App Server exposes account type, email and plan here, but no workspace ID.
+// API-key accounts have no stable identity in account/read, so direct sending is unavailable for them.
+private struct CodexAccountContext: Equatable {
+    let email: String
+    let plan: String
+
+    init?(_ response: [String: Any]) {
+        guard let account = response["account"] as? [String: Any],
+              account["type"] as? String == "chatgpt",
+              let email = account["email"] as? String, !email.isEmpty,
+              let plan = account["planType"] as? String else { return nil }
+        self.email = email; self.plan = plan
+    }
+}
+
+// In-memory, opt-in send diagnostics. Never retain thread IDs, paths, account data or text.
+private struct CodexSendDiagnostic {
+    let started = Date()
+    var stage = "preflight"
+    var method = "none"
+    var code: Int?
+    var summary = "Checking destination"
+    var turnStartAttempted = false
+    var delivery = "not sent"
+    var transport = "connected"
+    var listStatusAtSelection = "not recorded"
+    var readStatusBeforeResume = "not checked"
+    var readStatusAfterRejection = "not checked"
+    var loadedInKatescapeServer = "not checked"
+
+    var report: String {
+        """
+        Operation: Codex Desktop send
+        Time: \(ISO8601DateFormatter().string(from: started))
+        Stage: \(stage)
+        RPC method: \(method)
+        RPC code: \(code.map(String.init) ?? "none")
+        Result: \(summary)
+        turn/start attempted: \(turnStartAttempted ? "yes" : "no")
+        Delivery: \(delivery)
+        App Server: \(transport)
+        thread/list status at selection: \(listStatusAtSelection)
+        thread/read before resume: \(readStatusBeforeResume)
+        thread/read after rejection: \(readStatusAfterRejection)
+        Loaded in Katescape App Server after rejection: \(loadedInKatescapeServer)
+        """
+    }
 }
 
 private final class CodexThreadPickerView: NSView {
@@ -769,8 +1118,23 @@ final class Wave: NSView {
 final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
     var provider = ProviderID(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .claude
     var pillProviderMenu: NSMenu?
+    private var pillTerminalMenu: NSMenu?
     private var historyClient: CodexHistoryClient?
     private var discoveredThreads: [CodexHistoryClient.Thread] = []
+    private var browsedCodexAccount: CodexAccountContext?
+    private enum CodexRoute { case terminal, desktop }
+    private var codexRoute: CodexRoute = .terminal
+    private var selectedCodexThread: CodexHistoryClient.Thread?
+    private var selectedCodexAccount: CodexAccountContext?
+    private var codexStarting = false
+    private var codexAwaitingTurnAck = false
+    private var codexTurnID: String?
+    private var codexFinalText = ""
+    private var codexFileChangePreviews: [String: String] = [:]
+    private var codexQueuedEvents: [(String, [String: Any])] = []
+    private var codexQueuedRequests: [(Any, String, [String: Any])] = []
+    private var codexActivity = ""
+    private var codexSendDiagnostic: CodexSendDiagnostic?
     var panel: Panel!
     var field: Field!
     var status: NSTextField!
@@ -806,6 +1170,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     var pages: [String] = [], page = 0
     var prevBtn: Tap!, nextBtn: Tap!, pageLabel: NSTextField!
     var sending = false
+    private var launcherInProgress = false
     var lastApp: NSRunningApplication?
     var open = false
 
@@ -902,19 +1267,19 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         mini.textColor = NSColor(white: 1, alpha: 0.85)
         glass.addSubview(mini)
 
-        field = Field(frame: NSRect(x: 46, y: (H - 2 - 22)/2, width: W - 46 - 160, height: 22))
-        field.placeholderAttributedString = NSAttributedString(string: "Message Mochi…",
-            attributes: [.foregroundColor: NSColor(white: 1, alpha: 0.62), .font: NSFont.systemFont(ofSize: 14)])
+        field = Field(frame: NSRect(x: 46, y: (H - 2 - 22)/2, width: W - 46 - 194, height: 22))
+        resetPlaceholder()
         field.font = .systemFont(ofSize: 14); field.textColor = .white
         field.isBordered = false; field.drawsBackground = false; field.focusRingType = .none
         field.cell?.usesSingleLineMode = true; field.cell?.isScrollable = true; field.cell?.wraps = false
         field.delegate = self
         glass.addSubview(field)
 
-        status = NSTextField(labelWithString: "→ \(provider.adapter.name)")
+        status = NSTextField(labelWithString: "desktop commands")
         status.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
         status.textColor = NSColor(white: 1, alpha: 0.6); status.alignment = .right
-        status.frame = NSRect(x: W - 2 - 152, y: (H - 2 - 14)/2, width: 132, height: 14)
+        status.frame = NSRect(x: W - 2 - 186, y: (H - 2 - 14)/2, width: 166, height: 14)
+        status.cell?.lineBreakMode = .byTruncatingMiddle
         glass.addSubview(status)
 
         // on top of everything: the paper plane
@@ -925,12 +1290,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         ring.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(tapped(_:))))
 
         let menu = NSMenu()
-        let providerItem = NSMenuItem(title: "Provider", action: nil, keyEquivalent: "")
-        let providerMenu = makeProviderMenu()
-        providerItem.submenu = providerMenu; pillProviderMenu = providerMenu
-        menu.addItem(providerItem)
         let browse = NSMenuItem(title: "Browse Codex Threads…", action: #selector(browseCodexThreads), keyEquivalent: "")
         browse.target = self; menu.addItem(browse)
+        let advanced = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
+        advanced.submenu = makeAdvancedMenu(pill: true); menu.addItem(advanced)
         menu.addItem(.separator())
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -948,10 +1311,6 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         lay()
         panel.orderFrontRegardless()
         makeStatusItem()
-
-        // ask macOS for Accessibility up front (it adds the bar to the list and shows its own prompt)
-        let opt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        _ = AXIsProcessTrustedWithOptions([opt: true] as CFDictionary)
 
         makeBubble()
         lastSeen = modified()   // don't pop up an old reply at launch
@@ -1000,14 +1359,14 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         m.removeAllItems()
         func item(_ t: String, _ a: Selector) { let i = NSMenuItem(title: t, action: a, keyEquivalent: ""); i.target = self; m.addItem(i) }
         item("Find Mochi", #selector(findMochi))
-        item("Message Mochi…", #selector(messageMochi))
+        item("Ask Katescape…", #selector(messageMochi))
         let n = todos.filter { $0.done == nil }.count
         item(n > 0 ? "To-do list (\(n))" : "To-do list", #selector(openTodoFromMenu))
         item(panel.isVisible ? "Hide Mochi" : "Show Mochi", #selector(toggleShown))
         m.addItem(.separator())
-        let providerItem = NSMenuItem(title: "Provider", action: nil, keyEquivalent: "")
-        providerItem.submenu = makeProviderMenu(); m.addItem(providerItem)
         item("Browse Codex Threads…", #selector(browseCodexThreads))
+        let advanced = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
+        advanced.submenu = makeAdvancedMenu(); m.addItem(advanced)
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off; m.addItem(login)
         m.addItem(withTitle: "Quit Mochi", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1023,11 +1382,89 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         return menu
     }
 
+    private func makeAdvancedMenu(pill: Bool = false) -> NSMenu {
+        let menu = NSMenu()
+        let providerItem = NSMenuItem(title: "Provider", action: nil, keyEquivalent: "")
+        providerItem.submenu = makeProviderMenu()
+        if pill { pillProviderMenu = providerItem.submenu }
+        menu.addItem(providerItem)
+        let terminalItem = NSMenuItem(title: "Terminal Destination", action: nil, keyEquivalent: "")
+        terminalItem.submenu = makeTerminalDestinationMenu()
+        if pill { pillTerminalMenu = terminalItem.submenu }
+        menu.addItem(terminalItem)
+        let sendItem = NSMenuItem(title: "Send Draft to Selected CLI in Terminal…",
+                                  action: #selector(sendAdvancedMessage), keyEquivalent: "")
+        sendItem.target = self; menu.addItem(sendItem)
+        return menu
+    }
+
+    private func makeTerminalDestinationMenu() -> NSMenu {
+        let menu = NSMenu()
+        for id in ProviderID.allCases {
+            let item = NSMenuItem(title: "\(id.adapter.name) in Terminal",
+                                  action: #selector(selectTerminalDestination(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = id.rawValue
+            item.state = id == provider && codexRoute == .terminal ? .on : .off
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func selectTerminalDestination(_ item: NSMenuItem) {
+        guard let raw = item.representedObject as? String, let next = ProviderID(rawValue: raw) else { return }
+        if next != provider { selectProvider(item) }
+        if next == .codex && codexRoute != .terminal { useCodexTerminal() }
+        pillTerminalMenu?.items.forEach {
+            $0.state = ($0.representedObject as? String) == next.rawValue ? .on : .off
+        }
+    }
+
+    @objc private func showCodexSendDiagnostics() {
+        let enabled = UserDefaults.standard.bool(forKey: "codexSendDiagnosticsEnabled")
+        let alert = NSAlert()
+        alert.messageText = "Codex send diagnostics"
+        if enabled {
+            alert.informativeText = codexSendDiagnostic?.report ?? "Enabled. No direct-send attempt has been recorded in this app session."
+            alert.addButton(withTitle: "Copy result")
+            alert.addButton(withTitle: "Disable")
+            alert.addButton(withTitle: "Close")
+        } else {
+            alert.informativeText = "Enable in-memory diagnostics for future Codex Desktop sends? They record the failing stage, RPC method and code, delivery state, and process failures. They never retain message text, transcripts, thread IDs, paths, or account data."
+            alert.addButton(withTitle: "Enable")
+            alert.addButton(withTitle: "Cancel")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let choice = alert.runModal()
+        if enabled {
+            if choice == .alertFirstButtonReturn, let report = codexSendDiagnostic?.report {
+                NSPasteboard.general.clearContents()
+                _ = NSPasteboard.general.setString(report, forType: .string)
+            } else if choice == .alertSecondButtonReturn {
+                UserDefaults.standard.set(false, forKey: "codexSendDiagnosticsEnabled")
+                codexSendDiagnostic = nil
+            }
+        } else if choice == .alertFirstButtonReturn {
+            UserDefaults.standard.set(true, forKey: "codexSendDiagnosticsEnabled")
+            codexSendDiagnostic = nil
+        }
+    }
+
+    @objc private func useCodexTerminal() {
+        guard provider == .codex else { return }
+        let wasActive = codexStarting || codexTurnID != nil
+        clearCodexDestination()
+        updateDestinationDisplay()
+        if wasActive { flash("Codex turn may continue; follow it in Codex", false) }
+    }
+
     @objc func selectProvider(_ item: NSMenuItem) {
         guard let raw = item.representedObject as? String, let next = ProviderID(rawValue: raw), next != provider else { return }
+        let wasActive = codexStarting || codexTurnID != nil
+        if provider == .codex { clearCodexDestination() }
         provider = next
         UserDefaults.standard.set(next.rawValue, forKey: "provider")
         pillProviderMenu?.items.forEach { $0.state = ($0.representedObject as? String) == next.rawValue ? .on : .off }
+        pillTerminalMenu?.items.forEach { $0.state = ($0.representedObject as? String) == next.rawValue ? .on : .off }
         answeringOther = false; resetPlaceholder()
         dot.thinking = false; dot.asking = false
         meterText = ""; meter.stringValue = ""
@@ -1042,8 +1479,33 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
                 qShownId = question["id"] as? String ?? ""
             }
         }
-        status.stringValue = "→ \(next.adapter.name)"
+        updateDestinationDisplay()
+        if wasActive { flash("Codex turn may continue; follow it in Codex", false) }
         if !open { fitCollapsed() }; lay()
+    }
+
+    private func destinationLabel() -> String {
+        "desktop commands"
+    }
+
+    private func updateDestinationDisplay() {
+        status.stringValue = destinationLabel()
+        status.textColor = NSColor(white: 1, alpha: 0.6)
+        status.toolTip = "Ask for a desktop action. Terminal sending is in Advanced."
+        resetPlaceholder()
+        if !open { fitCollapsed() }; lay()
+    }
+
+    private func clearCodexDestination() {
+        if let client = historyClient {
+            for (id, method, _) in codexQueuedRequests { declineCodexRequest(id, method, client: client) }
+        }
+        historyClient?.stop(); historyClient = nil
+        selectedCodexThread = nil; selectedCodexAccount = nil; browsedCodexAccount = nil
+        discoveredThreads = []; codexRoute = .terminal
+        codexStarting = false; codexAwaitingTurnAck = false; codexTurnID = nil
+        codexQueuedEvents = []; codexQueuedRequests = []; codexFinalText = ""; codexFileChangePreviews = [:]
+        codexActivity = ""; sending = false; dot.thinking = false
     }
 
     // A separate, consented history surface. It never changes the Terminal destination.
@@ -1051,19 +1513,39 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         if !UserDefaults.standard.bool(forKey: "codexHistoryConsent") {
             let alert = NSAlert()
             alert.messageText = "Browse local Codex threads?"
-            alert.informativeText = "Katescape will start its own local Codex App Server connection and read thread titles, directories and selected transcript text. It will not resume a thread or send a message. Thread data stays in memory."
+            alert.informativeText = "Katescape will start its own local Codex App Server connection to browse thread titles, directories and selected transcript text. Browsing is read-only. Thread data stays in memory."
             alert.addButton(withTitle: "Allow browsing")
             alert.addButton(withTitle: "Cancel")
             NSApp.activate(ignoringOtherApps: true)
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                showBubble("Okay, I didn't open Codex conversations.", project: "Katescape", react: false)
+                return
+            }
             UserDefaults.standard.set(true, forKey: "codexHistoryConsent")
         }
-        historyClient?.stop(); historyClient = nil; discoveredThreads = []
+        guard !codexStarting && codexTurnID == nil else {
+            historyError("A Codex turn is active. Wait for it to finish before browsing conversations.", closeConnection: false)
+            return
+        }
+        clearCodexDestination()
+        historyClient?.stop(); historyClient = nil; discoveredThreads = []; browsedCodexAccount = nil
         guard let executable = executablePath(for: CodexProvider()) else {
             historyError("Codex CLI is unavailable. Install it separately before browsing threads."); return
         }
         let client = CodexHistoryClient(executable: executable)
         historyClient = client
+        client.onNotification = { [weak self, weak client] method, params in
+            guard let self, let client, self.historyClient === client else { return }
+            self.codexNotification(method, params, client: client)
+        }
+        client.onServerRequest = { [weak self, weak client] id, method, params in
+            guard let self, let client, self.historyClient === client else { return }
+            self.codexServerRequest(id, method, params, client: client)
+        }
+        client.onDisconnect = { [weak self, weak client] reason in
+            guard let self, let client, self.historyClient === client else { return }
+            self.codexDisconnected(reason)
+        }
         flash("reading Codex threads…", false)
         client.connect { [weak self, weak client] result in
             guard let self, let client, self.historyClient === client else { return }
@@ -1080,7 +1562,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
                     if requiresAuth &&
                         (response["account"] == nil || response["account"] is NSNull) {
                         self.historyError("Codex sign-in is unavailable. Sign in using Codex, then try again.")
-                    } else { self.loadCodexThreads(client, cursor: nil, page: 0, seen: []) }
+                    } else {
+                        self.browsedCodexAccount = CodexAccountContext(response)
+                        self.loadCodexThreads(client, cursor: nil, page: 0, seen: [])
+                    }
                 }
             }
         }
@@ -1117,16 +1602,35 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         }
         let alert = NSAlert()
         alert.messageText = "Local Codex threads"
-        alert.informativeText = "Showing up to 100 local threads. Choose one to read its latest 8 turns."
+        alert.informativeText = "Showing up to 100 local threads. Preview the latest 8 turns or open a thread in Codex."
         let picker = CodexThreadPickerView(threads: discoveredThreads)
         alert.accessoryView = picker
         alert.addButton(withTitle: "View selected")
         alert.addButton(withTitle: "Close")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+        let choice = alert.runModal()
+        if choice == .alertFirstButtonReturn {
             guard let selected = picker.selected else { historyError("No thread was selected."); return }
             readCodexThread(client, selected)
         } else { client.stop(); historyClient = nil; discoveredThreads = [] }
+    }
+
+    private func selectCodexConversation(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread) {
+        guard historyClient === client, thread.local else {
+            historyError("This thread is not a confirmed local Codex conversation."); return
+        }
+        guard let account = browsedCodexAccount else {
+            historyError("Direct sending requires a verifiable ChatGPT Codex account. Read-only browsing is still available."); return
+        }
+        if provider != .codex {
+            let item = NSMenuItem()
+            item.representedObject = ProviderID.codex.rawValue
+            selectProvider(item)
+        }
+        selectedCodexThread = thread; selectedCodexAccount = account
+        codexRoute = .desktop; discoveredThreads = []
+        updateDestinationDisplay()
+        flash("Codex Desktop selected")
     }
 
     private func readCodexThread(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread) {
@@ -1191,8 +1695,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         } else { showCodexThreadPicker(client) }
     }
 
-    private func historyError(_ message: String) {
-        historyClient?.stop(); historyClient = nil; discoveredThreads = []
+    private func historyError(_ message: String, closeConnection: Bool = true) {
+        if closeConnection { historyClient?.stop(); historyClient = nil; discoveredThreads = [] }
+        showBubble("I couldn't load Codex conversations. Your draft is still here.",
+                   project: "Katescape", react: false)
         let alert = NSAlert()
         alert.messageText = "Codex threads unavailable"
         alert.informativeText = message
@@ -1513,7 +2019,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     }
 
     func showBubble(_ text: String, project: String, react: Bool = true, full: String? = nil) {
-        note("bubble: " + String(text.prefix(30)))
+        note("bubble shown")
         // the goo reacts: a proud double hop with sparkles when something went live, otherwise a hop
         if react {
             if text.range(of: #"\b(live|pushed|deployed|shipped|published)\b"#, options: [.regularExpression, .caseInsensitive]) != nil { dot.proud() } else { dot.hop() }
@@ -1655,7 +2161,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         status.stringValue = s; status.textColor = c
         mini.stringValue = s; mini.textColor = c; mini.sizeToFit(); fitCollapsed(); lay(); mini.needsDisplay = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            self.status.stringValue = "→ \(self.provider.adapter.name)"; self.status.textColor = NSColor(white: 1, alpha: 0.6)
+            self.status.stringValue = self.destinationLabel(); self.status.textColor = NSColor(white: 1, alpha: 0.6)
             self.mini.stringValue = "Mochi"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.fitCollapsed(); self.lay()
         }
     }
@@ -1669,11 +2175,536 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
 
     // MARK: sending
 
+    private func safeCodexStatus(_ status: String) -> String {
+        ["notLoaded", "idle", "active", "systemError"].contains(status) ? status : "unsupported"
+    }
+
+    private func recordCodexReadStatus(_ status: String, afterRejection: Bool = false) {
+        guard var diagnostic = codexSendDiagnostic else { return }
+        if afterRejection { diagnostic.readStatusAfterRejection = safeCodexStatus(status) }
+        else { diagnostic.readStatusBeforeResume = safeCodexStatus(status) }
+        codexSendDiagnostic = diagnostic
+    }
+
+    private func markCodexDiagnostic(stage: String, method: String? = nil, summary: String? = nil,
+                                     attempted: Bool? = nil, delivery: String? = nil) {
+        guard var diagnostic = codexSendDiagnostic else { return }
+        diagnostic.stage = stage
+        if let method { diagnostic.method = method }
+        if let summary { diagnostic.summary = summary }
+        if let attempted { diagnostic.turnStartAttempted = attempted }
+        if let delivery { diagnostic.delivery = delivery }
+        codexSendDiagnostic = diagnostic
+    }
+
+    private func failCodexDiagnostic(stage: String, method: String, error: Error?,
+                                     summary: String, delivery: String) {
+        guard var diagnostic = codexSendDiagnostic else { return }
+        diagnostic.stage = stage; diagnostic.method = method; diagnostic.delivery = delivery
+        if let failure = error as? CodexHistoryClient.Failure {
+            diagnostic.code = failure.rpcCode
+            diagnostic.summary = failure.safeSummary
+        } else { diagnostic.summary = summary }
+        codexSendDiagnostic = diagnostic
+    }
+
+    private func codexTransportFailed(_ failure: CodexHistoryClient.Failure) {
+        guard var diagnostic = codexSendDiagnostic else { return }
+        switch failure {
+        case .timeout(let method): diagnostic.transport = "timeout during \(method)"
+        case .exited(let status): diagnostic.transport = "process exited (status \(status))"
+        default: diagnostic.transport = "connection closed or protocol error"
+        }
+        if diagnostic.delivery == "pending acknowledgment" {
+            diagnostic.delivery = "uncertain"; diagnostic.summary = failure.safeSummary
+        } else if diagnostic.delivery == "acknowledged" {
+            diagnostic.stage = "response stream"; diagnostic.method = "turn/completed"
+            diagnostic.delivery = "acknowledged; completion unknown"
+            diagnostic.summary = failure.safeSummary
+        }
+        codexSendDiagnostic = diagnostic
+    }
+
+    private func codexIsSelected(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread) -> Bool {
+        provider == .codex && codexRoute == .desktop && historyClient === client &&
+            selectedCodexThread?.id == thread.id && selectedCodexThread?.cwd == thread.cwd
+    }
+
+    private func verifyCodexAccount(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread,
+                                    _ done: @escaping (Result<Void, Error>) -> Void) {
+        client.request("account/read", ["refreshToken": false]) { [weak self, weak client] result in
+            guard let self, let client, self.codexIsSelected(client, thread) else { return }
+            switch result {
+            case .failure(let error): done(.failure(error))
+            case .success(let value):
+                guard let expected = self.selectedCodexAccount, CodexAccountContext(value) == expected else {
+                    done(.failure(CodexHistoryClient.Failure.validation("Codex account context changed; reselect the conversation")))
+                    return
+                }
+                done(.success(()))
+            }
+        }
+    }
+
+    private func verifyCodexThread(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread,
+                                   method: String, _ done: @escaping (Result<Void, Error>) -> Void) {
+        let params: [String: Any] = method == "thread/resume"
+            ? ["threadId": thread.id, "excludeTurns": true] : ["threadId": thread.id]
+        client.request(method, params) { [weak self, weak client] result in
+            guard let self, let client, self.codexIsSelected(client, thread) else { return }
+            switch result {
+            case .failure(let error): done(.failure(error))
+            case .success(let value):
+                guard let metadata = value["thread"] as? [String: Any],
+                      let current = CodexHistoryClient.Thread(metadata) else {
+                    done(.failure(CodexHistoryClient.Failure.validation("Unsupported thread metadata; no message was sent")))
+                    return
+                }
+                if method == "thread/read", codexSendDiagnostic?.stage == "thread before resume" {
+                    recordCodexReadStatus(current.status)
+                }
+                guard current.id == thread.id else {
+                    done(.failure(CodexHistoryClient.Failure.validation("Thread ID changed; no message was sent"))); return
+                }
+                guard current.cwd == thread.cwd,
+                      method != "thread/resume" || value["cwd"] as? String == thread.cwd else {
+                    done(.failure(CodexHistoryClient.Failure.validation("Thread working directory changed; no message was sent"))); return
+                }
+                guard current.projectID == thread.projectID, current.modelProvider == thread.modelProvider,
+                      current.local else {
+                    done(.failure(CodexHistoryClient.Failure.validation("Thread project, model provider or locality changed; no message was sent"))); return
+                }
+                guard current.status == "idle" || current.status == "notLoaded" else {
+                    let state = ["active", "systemError"].contains(current.status) ? current.status : "unsupported"
+                    done(.failure(CodexHistoryClient.Failure.validation("Thread status in this App Server is \(state); no message was sent")))
+                    return
+                }
+                done(.success(()))
+            }
+        }
+    }
+
+    private func sendToCodexDesktop(_ text: String) {
+        if UserDefaults.standard.bool(forKey: "codexSendDiagnosticsEnabled") {
+            codexSendDiagnostic = CodexSendDiagnostic()
+        }
+        guard !codexStarting && codexTurnID == nil else {
+            failCodexDiagnostic(stage: "turn status", method: "none", error: nil,
+                                summary: "A turn is already in progress", delivery: "not sent")
+            flash("Codex is already working; draft kept", false); return
+        }
+        guard let client = historyClient, let thread = selectedCodexThread,
+              selectedCodexAccount != nil, thread.local else {
+            failCodexDiagnostic(stage: "destination selection", method: "none", error: nil,
+                                summary: "No verified selected destination or connection", delivery: "not sent")
+            flash("Codex Desktop destination unavailable; reselect it", false); return
+        }
+        if var diagnostic = codexSendDiagnostic {
+            diagnostic.listStatusAtSelection = safeCodexStatus(thread.status)
+            codexSendDiagnostic = diagnostic
+        }
+        codexStarting = true; sending = true; codexActivity = "checking Codex…"
+        codexQueuedEvents = []; codexQueuedRequests = []; codexFinalText = ""; codexFileChangePreviews = [:]
+        updateDestinationDisplay()
+        markCodexDiagnostic(stage: "account before resume", method: "account/read",
+                            summary: "Checking account context")
+        verifyCodexAccount(client, thread) { [weak self, weak client] account in
+            guard let self, let client, self.codexIsSelected(client, thread) else { return }
+            if case .failure(let error) = account {
+                self.codexStartFailed(error.localizedDescription, stage: "account before resume",
+                                      method: "account/read", error: error); return
+            }
+            self.markCodexDiagnostic(stage: "thread before resume", method: "thread/read",
+                                     summary: "Checking selected thread metadata and status")
+            self.verifyCodexThread(client, thread, method: "thread/read") { [weak self, weak client] read in
+                guard let self, let client, self.codexIsSelected(client, thread) else { return }
+                if case .failure(let error) = read {
+                    self.codexStartFailed(error.localizedDescription, stage: "thread before resume",
+                                          method: "thread/read", error: error); return
+                }
+                self.markCodexDiagnostic(stage: "resume selected thread", method: "thread/resume",
+                                         summary: "Resuming the explicitly selected thread")
+                self.verifyCodexThread(client, thread, method: "thread/resume") { [weak self, weak client] resumed in
+                    guard let self, let client, self.codexIsSelected(client, thread) else { return }
+                    if case .failure(let error) = resumed {
+                        let activeWork = (error as? CodexHistoryClient.Failure)?.activeWorkCategory
+                        let message = activeWork == nil ? error.localizedDescription :
+                            "Codex reports active work or another writer; draft kept"
+                        self.codexStartFailed(message, stage: "resume selected thread",
+                                              method: "thread/resume", error: error)
+                        if let activeWork { self.inspectBlockedCodexResume(client, thread, category: activeWork) }
+                        return
+                    }
+                    self.markCodexDiagnostic(stage: "account after resume", method: "account/read",
+                                             summary: "Rechecking account context")
+                    self.verifyCodexAccount(client, thread) { [weak self, weak client] accountAgain in
+                        guard let self, let client, self.codexIsSelected(client, thread) else { return }
+                        if case .failure(let error) = accountAgain {
+                            self.codexStartFailed(error.localizedDescription, stage: "account after resume",
+                                                  method: "account/read", error: error); return
+                        }
+                        self.markCodexDiagnostic(stage: "thread after resume", method: "thread/read",
+                                                 summary: "Rechecking selected thread metadata and status")
+                        self.verifyCodexThread(client, thread, method: "thread/read") { [weak self, weak client] ready in
+                            guard let self, let client, self.codexIsSelected(client, thread) else { return }
+                            if case .failure(let error) = ready {
+                                self.codexStartFailed(error.localizedDescription, stage: "thread after resume",
+                                                      method: "thread/read", error: error); return
+                            }
+                            self.startCodexTurn(client, thread, text: text)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func startCodexTurn(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread, text: String) {
+        guard codexIsSelected(client, thread), codexStarting else { return }
+        codexAwaitingTurnAck = true
+        markCodexDiagnostic(stage: "turn start", method: "turn/start",
+                            summary: "Waiting for turn acknowledgment", attempted: true,
+                            delivery: "pending acknowledgment")
+        // No cwd, model, sandbox or approval-policy override: retain this thread's settings.
+        client.request("turn/start", ["threadId": thread.id, "input": [["type": "text", "text": text]]],
+                       timeout: 20) { [weak self, weak client] result in
+            guard let self, let client, self.codexIsSelected(client, thread) else { return }
+            switch result {
+            case .failure(let error):
+                let rejected = (error as? CodexHistoryClient.Failure).map { failure in
+                    if case .rejected = failure { return true }
+                    return false
+                } ?? false
+                self.codexStartFailed("Send \(rejected ? "rejected" : "status uncertain"): \(error.localizedDescription). Check Codex before retrying.",
+                                      stage: "turn start", method: "turn/start", error: error,
+                                      delivery: rejected ? "rejected" : "uncertain")
+            case .success(let value):
+                guard let turn = value["turn"] as? [String: Any],
+                      let id = turn["id"] as? String, !id.isEmpty,
+                      let status = turn["status"] as? String,
+                      ["inProgress", "completed", "failed", "interrupted"].contains(status) else {
+                    self.codexStartFailed("Send acknowledgment was invalid. Check Codex before retrying.",
+                                          stage: "turn acknowledgment", method: "turn/start",
+                                          error: CodexHistoryClient.Failure.validation("Invalid turn/start response"),
+                                          delivery: "uncertain")
+                    return
+                }
+                self.markCodexDiagnostic(stage: "turn acknowledged", method: "turn/start",
+                                         summary: "App Server accepted this turn", delivery: "acknowledged")
+                self.codexTurnID = id; self.codexStarting = false; self.codexAwaitingTurnAck = false
+                self.codexActivity = "Codex working…"
+                self.dot.thinking = true
+                // A new draft typed while App Server was responding belongs to the next turn.
+                if self.field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == text {
+                    self.field.stringValue = ""
+                }
+                self.updateDestinationDisplay()
+                self.celebrateSend()
+                let queued = self.codexQueuedEvents; self.codexQueuedEvents = []
+                for (method, params) in queued { self.codexNotification(method, params, client: client) }
+                let requests = self.codexQueuedRequests; self.codexQueuedRequests = []
+                for (requestID, method, params) in requests {
+                    self.codexServerRequest(requestID, method, params, client: client)
+                }
+                if status != "inProgress" && self.codexTurnID == id {
+                    self.finishCodexTurn(status: status, error: nil, thread: thread)
+                }
+            }
+        }
+    }
+
+    private func codexStartFailed(_ message: String, stage: String, method: String,
+                                  error: Error? = nil, delivery: String = "not sent") {
+        failCodexDiagnostic(stage: stage, method: method, error: error,
+                            summary: "Send stopped before turn/start", delivery: delivery)
+        if let client = historyClient {
+            for (id, method, _) in codexQueuedRequests { declineCodexRequest(id, method, client: client) }
+        }
+        codexStarting = false; codexAwaitingTurnAck = false; sending = false
+        codexQueuedEvents = []; codexQueuedRequests = []; codexFileChangePreviews = [:]
+        codexActivity = "Codex failed"; dot.thinking = false; dot.worry(); updateDestinationDisplay()
+        flash(message, false) // Draft remains in the field.
+    }
+
+    private func inspectBlockedCodexResume(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread,
+                                           category: String) {
+        guard codexIsSelected(client, thread) else { return }
+        // Read-only checks on this connection. They do not reveal Codex Desktop's process state.
+        client.request("thread/read", ["threadId": thread.id]) { [weak self, weak client] read in
+            guard let self, let client, self.codexIsSelected(client, thread) else { return }
+            if case .success(let result) = read,
+               let value = result["thread"] as? [String: Any],
+               value["id"] as? String == thread.id,
+               let status = value["status"] as? [String: Any],
+               let type = status["type"] as? String {
+                self.recordCodexReadStatus(type, afterRejection: true)
+            } else if var diagnostic = self.codexSendDiagnostic {
+                diagnostic.readStatusAfterRejection = "unavailable"
+                self.codexSendDiagnostic = diagnostic
+            }
+            client.request("thread/loaded/list", [:]) { [weak self, weak client] loaded in
+                guard let self, let client, self.codexIsSelected(client, thread) else { return }
+                if var diagnostic = self.codexSendDiagnostic {
+                    if case .success(let result) = loaded, let ids = result["data"] as? [String] {
+                        diagnostic.loadedInKatescapeServer = ids.contains(thread.id) ? "yes" :
+                            (result["nextCursor"] as? String == nil ? "no" : "not in first page")
+                    } else { diagnostic.loadedInKatescapeServer = "unavailable" }
+                    self.codexSendDiagnostic = diagnostic
+                }
+                self.showBlockedCodexResume(thread, category: category)
+            }
+        }
+    }
+
+    private func showBlockedCodexResume(_ thread: CodexHistoryClient.Thread, category: String) {
+        guard selectedCodexThread?.id == thread.id, provider == .codex, codexRoute == .desktop else { return }
+        let alert = NSAlert()
+        alert.messageText = "Codex cannot resume this conversation now"
+        let writerConflict = category.contains("writer") || category.contains("rollout path")
+        alert.informativeText = writerConflict
+            ? "Another Codex process holds this conversation's writer. An idle status in Katescape's separate App Server does not release that ownership. Katescape did not send the draft. Continue in Codex; Katescape will not retry automatically."
+            : "App Server reports active work or another owner. Katescape did not send the draft. Its status checks cannot establish whether Codex Desktop owns a running turn. Continue in Codex; Katescape will not retry automatically."
+        alert.addButton(withTitle: "Open in Codex")
+        alert.addButton(withTitle: "Keep draft")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            guard thread.local, let url = URL(string: "codex://threads/\(thread.id)"),
+                  NSWorkspace.shared.open(url) else {
+                flash("Could not open Codex; draft kept", false); return
+            }
+        }
+    }
+
+    private func codexNotification(_ method: String, _ params: [String: Any], client: CodexHistoryClient) {
+        guard let thread = selectedCodexThread, codexIsSelected(client, thread),
+              params["threadId"] as? String == thread.id else { return }
+        if codexAwaitingTurnAck && codexTurnID == nil {
+            if codexQueuedEvents.count < 100 { codexQueuedEvents.append((method, params)) }
+            return
+        }
+        if method == "thread/status/changed", codexTurnID != nil,
+           let status = params["status"] as? [String: Any],
+           status["type"] as? String == "active",
+           let flags = status["activeFlags"] as? [String], flags.contains("waitingOnApproval") {
+            codexActivity = "Codex needs approval…"; updateDestinationDisplay()
+            return
+        }
+        guard let activeID = codexTurnID else { return }
+        if method == "item/started", params["turnId"] as? String == activeID,
+           let item = params["item"] as? [String: Any], item["type"] as? String == "fileChange",
+           let itemID = item["id"] as? String,
+           let changes = item["changes"] as? [[String: Any]] {
+            let preview = changes.map { change in
+                "\(change["path"] as? String ?? "Unknown file")\n\(change["diff"] as? String ?? "Diff unavailable")"
+            }.joined(separator: "\n\n")
+            if !preview.isEmpty && preview.count <= 6_000 { codexFileChangePreviews[itemID] = preview }
+        } else if method == "item/completed", params["turnId"] as? String == activeID,
+           let item = params["item"] as? [String: Any],
+           item["type"] as? String == "agentMessage",
+           let text = item["text"] as? String, !text.isEmpty,
+           (item["phase"] as? String == "final_answer" || item["phase"] == nil) {
+            codexFinalText = String(text.prefix(20_000))
+        } else if method == "turn/completed",
+                  let turn = params["turn"] as? [String: Any],
+                  turn["id"] as? String == activeID,
+                  let status = turn["status"] as? String {
+            if codexFinalText.isEmpty, let items = turn["items"] as? [[String: Any]] {
+                let messages = items.filter { $0["type"] as? String == "agentMessage" &&
+                    ($0["phase"] as? String == "final_answer" || $0["phase"] == nil) }
+                if let text = messages.last?["text"] as? String {
+                    codexFinalText = String(text.prefix(20_000))
+                }
+            }
+            let error = (turn["error"] as? [String: Any])?["message"] as? String
+            finishCodexTurn(status: status, error: error, thread: thread)
+        }
+    }
+
+    private func finishCodexTurn(status: String, error: String?, thread: CodexHistoryClient.Thread) {
+        guard provider == .codex, codexRoute == .desktop,
+              selectedCodexThread?.id == thread.id, codexTurnID != nil else { return }
+        codexTurnID = nil; sending = false; dot.thinking = false
+        if status == "completed" {
+            markCodexDiagnostic(stage: "turn completed", method: "turn/completed",
+                                summary: "App Server reported completed", delivery: "completed")
+            codexActivity = "Codex completed"
+            updateDestinationDisplay()
+            if !codexFinalText.isEmpty {
+                showBubble(codexFinalText, project: thread.title, react: false)
+            } else { flash("Codex completed; view reply in Codex") }
+        } else {
+            markCodexDiagnostic(stage: "turn completed", method: "turn/completed",
+                                summary: status == "failed" ? "App Server reported failed" : "App Server reported interrupted",
+                                delivery: "acknowledged; \(status)")
+            codexActivity = status == "failed" ? "Codex failed" : "Codex interrupted"
+            updateDestinationDisplay()
+            flash(String((error ?? codexActivity).prefix(180)), false)
+        }
+        codexFinalText = ""; codexFileChangePreviews = [:]
+    }
+
+    private func codexDisconnected(_ reason: CodexHistoryClient.Failure) {
+        guard provider == .codex, codexRoute == .desktop else { return }
+        codexTransportFailed(reason)
+        historyClient = nil; codexStarting = false; codexAwaitingTurnAck = false; codexTurnID = nil
+        codexQueuedEvents = []; codexQueuedRequests = []; codexFileChangePreviews = [:]; sending = false
+        dot.thinking = false; dot.worry()
+        codexActivity = "Codex disconnected"
+        updateDestinationDisplay()
+        flash("Codex disconnected; check Codex before retrying", false)
+    }
+
+    private func declineCodexRequest(_ id: Any, _ method: String, client: CodexHistoryClient) {
+        switch method {
+        case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
+            client.respond(to: id, result: ["decision": "decline"])
+        case "item/permissions/requestApproval":
+            client.respond(to: id, result: ["permissions": [:], "scope": "turn"])
+        default: client.reject(to: id, message: "Katescape does not support this interactive request")
+        }
+    }
+
+    private func codexServerRequest(_ id: Any, _ method: String, _ params: [String: Any],
+                                    client: CodexHistoryClient) {
+        guard let thread = selectedCodexThread, codexIsSelected(client, thread),
+              params["threadId"] as? String == thread.id else {
+            client.reject(to: id, message: "No matching selected Codex thread"); return
+        }
+        if codexAwaitingTurnAck && codexTurnID == nil {
+            if codexQueuedRequests.count < 10 { codexQueuedRequests.append((id, method, params)) }
+            else { declineCodexRequest(id, method, client: client) }
+            return
+        }
+        guard let activeID = codexTurnID, params["turnId"] as? String == activeID else {
+            declineCodexRequest(id, method, client: client); return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Codex requests approval"
+        let reason = (params["reason"] as? String) ?? ""
+        codexActivity = "Codex needs approval…"; updateDestinationDisplay()
+        switch method {
+        case "item/commandExecution/requestApproval":
+            let command = params["command"] as? String
+            let cwd = (params["cwd"] as? String) ?? thread.cwd
+            let canApprove: Bool
+            if let network = params["networkApprovalContext"] as? [String: Any],
+               let host = network["host"] as? String,
+               let scheme = network["protocol"] as? String {
+                alert.informativeText = "Thread: \(thread.title)\nNetwork access: \(scheme)://\(host)\n\(String(reason.prefix(500)))"
+                alert.addButton(withTitle: "Approve once")
+                canApprove = true
+            } else if let command, !command.isEmpty, command.count <= 1_500 {
+                alert.informativeText = "Thread: \(thread.title)\nDirectory: \(cwd)\nCommand: \(String(command.prefix(1_500)))\n\(String(reason.prefix(500)))"
+                alert.addButton(withTitle: "Approve once")
+                canApprove = true
+            } else {
+                alert.informativeText = "Codex did not provide enough command details to review. This request can only be declined here."
+                canApprove = false
+            }
+            alert.addButton(withTitle: "Decline")
+            NSApp.activate(ignoringOtherApps: true)
+            let choice = alert.runModal()
+            let approved = canApprove && choice == .alertFirstButtonReturn &&
+                codexIsSelected(client, thread) && codexTurnID == activeID
+            client.respond(to: id, result: ["decision": approved ? "accept" : "decline"])
+        case "item/fileChange/requestApproval":
+            let root = (params["grantRoot"] as? String) ?? thread.cwd
+            let preview = (params["itemId"] as? String).flatMap { codexFileChangePreviews.removeValue(forKey: $0) }
+            alert.informativeText = "Thread: \(thread.title)\nRequested file root: \(root)\n\(String(reason.prefix(500)))"
+            if let preview {
+                let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 280))
+                scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+                let view = NSTextView(frame: scroll.bounds)
+                view.string = preview; view.isEditable = false; view.isSelectable = true
+                view.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+                scroll.documentView = view; alert.accessoryView = scroll
+                alert.addButton(withTitle: "Approve once")
+            } else { alert.informativeText += "\nNo complete change preview is available here; decline and review in Codex." }
+            alert.addButton(withTitle: "Decline")
+            NSApp.activate(ignoringOtherApps: true)
+            let choice = alert.runModal()
+            let approved = preview != nil && choice == .alertFirstButtonReturn &&
+                codexIsSelected(client, thread) && codexTurnID == activeID
+            client.respond(to: id, result: ["decision": approved ? "accept" : "decline"])
+        case "item/permissions/requestApproval":
+            guard let requested = params["permissions"] as? [String: Any],
+                  let data = try? JSONSerialization.data(withJSONObject: requested, options: [.prettyPrinted]),
+                  data.count < 2_500, let details = String(data: data, encoding: .utf8) else {
+                declineCodexRequest(id, method, client: client)
+                flash("Codex permission request too large to review; denied", false)
+                return
+            }
+            alert.informativeText = "Thread: \(thread.title)\nRequested access:\n\(details)\n\(String(reason.prefix(500)))"
+            alert.addButton(withTitle: "Grant once")
+            alert.addButton(withTitle: "Deny")
+            NSApp.activate(ignoringOtherApps: true)
+            let approved = alert.runModal() == .alertFirstButtonReturn &&
+                codexIsSelected(client, thread) && codexTurnID == activeID
+            client.respond(to: id, result: ["permissions": approved ? requested : [:], "scope": "turn"])
+        default:
+            client.reject(to: id, message: "Katescape cannot handle \(method); open Codex")
+            flash("Codex needs an unsupported interaction; open Codex", false)
+        }
+        if codexTurnID == activeID, codexIsSelected(client, thread) {
+            codexActivity = "Codex working…"; updateDestinationDisplay()
+        }
+    }
+
     func send() {
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
+        guard !text.isEmpty, !sending, !launcherInProgress else { return }
+        switch LauncherCommandParser().parse(text) {
+        case .message: break
+        case .browseCodexThreads:
+            showBubble("Looking for your Codex conversations…", project: "apps", react: false)
+            browseCodexThreads()
+            return
+        case .open(let names):
+            openLauncherApps(names, draft: text)
+            return
+        case .invalidAppReference:
+            dot.worry()
+            showBubble("Use an installed app name, not a path or link. Your message is still here.",
+                       project: "apps", react: false)
+            return
+        }
         if answeringOther && provider == .claude { answer(nil, other: text); return }
         if handleTodo(text) { return }
+        showBubble("I can open installed apps and show your Codex conversations. For CLI messages, use Advanced → Send Draft to Terminal.",
+                   project: "Katescape", react: false)
+    }
+
+    // CLI messaging requires an explicit Advanced menu action. Return in the
+    // universal field never falls through to provider sending.
+    @objc private func sendAdvancedMessage() {
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !sending, !launcherInProgress else {
+            if text.isEmpty { showBubble("Type a message first, then choose Advanced → Send Draft to Terminal.", project: "Katescape", react: false) }
+            return
+        }
+        guard provider != .codex || codexRoute == .terminal else {
+            showBubble("Choose Codex CLI in Terminal under Advanced before sending. Your draft is still here.",
+                       project: "Katescape", react: false)
+            return
+        }
+        let confirmation = NSAlert()
+        confirmation.messageText = "Send to \(provider.adapter.name) in Terminal?"
+        confirmation.informativeText = "Katescape will use an existing verified Terminal session. Your draft stays if you cancel."
+        confirmation.addButton(withTitle: "Continue")
+        confirmation.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+        guard AXIsProcessTrusted() else {
+            let opt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            _ = AXIsProcessTrustedWithOptions([opt: true] as CFDictionary)
+            showBubble("Allow Accessibility for Katescape, then retry Advanced sending. Your draft is still here.",
+                       project: "Katescape", react: false)
+            return
+        }
+        sendToSelectedTerminal(text)
+    }
+
+    private func sendToSelectedTerminal(_ text: String) {
         sending = true
         let selected = provider
         let adapter = selected.adapter
@@ -1713,6 +2744,101 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         paste(text, to: tty, provider: selected)
     }
 
+    private func openLauncherApps(_ names: [String], draft: String) {
+        launcherInProgress = true
+        sending = true
+        showBubble("Finding installed apps…", project: "apps", react: false)
+        // A fresh discovery for every command includes newly installed apps.
+        LauncherAppDiscovery.discover(names: names) { [weak self] catalog in
+            self?.launchRequestedApps(names, catalog: catalog, draft: draft, index: 0,
+                                      results: [], allSucceeded: true)
+        }
+    }
+
+    private func launchRequestedApps(_ names: [String], catalog: [InstalledApplication], draft: String,
+                                     index: Int, results: [String], allSucceeded: Bool) {
+        guard index < names.count else {
+            sending = false
+            launcherInProgress = false
+            if allSucceeded && field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == draft {
+                field.stringValue = ""
+            }
+            if !allSucceeded { dot.worry() }
+            showBubble(results.joined(separator: "; ") + (allSucceeded ? "." : ". Draft kept."),
+                       project: "apps", react: false)
+            return
+        }
+        let name = names[index]
+        let resolution = LauncherAppResolver.resolve(name, in: catalog)
+        let matches: [InstalledApplication]
+        let approximate: Bool
+        switch resolution {
+        case .missing:
+            launchRequestedApps(names, catalog: catalog, draft: draft, index: index + 1,
+                                results: results + ["Couldn't find \(name)"], allSucceeded: false)
+            return
+        case .exact(let apps), .alias(let apps): matches = apps; approximate = false
+        case .suggestions(let apps): matches = apps; approximate = true
+        }
+        let chosen: InstalledApplication?
+        if matches.count == 1 && !approximate { chosen = matches[0] }
+        else { chosen = chooseLauncherApp(matches, for: name, approximate: approximate) }
+        guard let app = chosen else {
+            launchRequestedApps(names, catalog: catalog, draft: draft, index: index + 1,
+                                results: results + ["Skipped \(name)"], allSucceeded: false)
+            return
+        }
+        launchInstalledApp(app) { [weak self] success, description in
+            self?.launchRequestedApps(names, catalog: catalog, draft: draft, index: index + 1,
+                                      results: results + [description], allSucceeded: allSucceeded && success)
+        }
+    }
+
+    private func chooseLauncherApp(_ apps: [InstalledApplication], for name: String,
+                                   approximate: Bool) -> InstalledApplication? {
+        let alert = NSAlert()
+        alert.messageText = approximate ? "Choose an app for \(name)" : "Several apps match \(name)"
+        alert.informativeText = approximate
+            ? "No exact app matched. Choose explicitly; Katescape won't guess."
+            : "Choose which installed copy to open."
+        alert.addButton(withTitle: "Open selected")
+        alert.addButton(withTitle: "Skip")
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 460, height: 28), pullsDown: false)
+        picker.addItems(withTitles: apps.map { "\($0.displayName) · \($0.url.path)" })
+        for (index, app) in apps.enumerated() { picker.item(at: index)?.toolTip = "\(app.bundleID)\n\(app.url.path)" }
+        alert.accessoryView = picker
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn,
+              apps.indices.contains(picker.indexOfSelectedItem) else { return nil }
+        return apps[picker.indexOfSelectedItem]
+    }
+
+    private func launchInstalledApp(_ app: InstalledApplication,
+                                    completion: @escaping (Bool, String) -> Void) {
+        guard let current = InstalledApplication(url: app.url), current.bundleID == app.bundleID else {
+            completion(false, "\(app.displayName) changed or is no longer available")
+            return
+        }
+        let running = NSWorkspace.shared.runningApplications.first {
+            !$0.isTerminated && $0.bundleIdentifier == app.bundleID &&
+                $0.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
+        }
+        if let running {
+            let activated = running.activate(options: [.activateAllWindows])
+            completion(activated, activated ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { launched, error in
+            DispatchQueue.main.async {
+                let verified = error == nil && launched?.bundleIdentifier == app.bundleID &&
+                    launched?.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
+                completion(verified, verified ? "Opened \(app.displayName)" : "Couldn't verify opening \(app.displayName)")
+            }
+        }
+    }
+
     func chooseSession(_ ttys: [String], provider name: String) -> String? {
         let alert = NSAlert()
         alert.messageText = "Choose a \(name) Terminal session"
@@ -1743,7 +2869,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         """).err
     }
 
-    func resetPlaceholder(_ s: String = "Message Mochi…") {
+    func resetPlaceholder(_ s: String = "Ask Katescape to do something…") {
         field.placeholderAttributedString = NSAttributedString(string: s, attributes: [.foregroundColor: NSColor(white: 1, alpha: 0.62), .font: NSFont.systemFont(ofSize: 14)])
     }
 
