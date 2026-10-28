@@ -1,50 +1,70 @@
 # Eden 🐱
 
-Eden is a pixel-art macOS desktop companion featuring a lavender cat. Click the cat to open a compact chat, use its universal macOS app launcher with commands such as “Open Figma and Codex,” or browse local Codex threads. Advanced Claude Code and Codex CLI Terminal controls remain available from the pet and menu bar menus.
+**A little pixel-art cat for your Mac.**
 
-Guided messaging for ChatGPT and Claude helps you compose a message, copies it to the clipboard after confirmation, and opens the destination app or website. You choose the conversation, paste, and send it yourself. Eden does not directly send to existing ChatGPT or Claude conversations.
+Eden is a playful macOS desktop companion that helps you open applications, navigate your workspace and interact with your favourite AI tools, all through a tiny lavender cat living on your desktop.
 
-The app lives in this repository at `~/Documents/GitHub/Eden Bot`. Internal Swift names, Claude hook paths, and `~/Library/Application Support/Mochi` remain unchanged so existing data and integrations continue to work.
+Originally forked from [Mochi](https://github.com/jessawolfe-ux/mochi) by [Jessa Wolfe](https://jessa.art/), Eden is customised and developed by [Kate Tacastacas](https://kateafable.com).
 
-## Build Eden
+## Features
 
-Requires macOS 13 or later, Apple's Swift command line tools, and the existing `Mochi Local Signing` identity for a signed installation. From this repository:
+- **Desktop Cat**: A lavender pixel-art companion with expressive animations. Click to chat, drag to reposition and right-click for more options.
+- **App Launcher**: Open installed Mac applications using natural-language commands, such as `Open Figma and Codex`.
+- **Guided AI Messaging**: Compose messages for ChatGPT or Claude, then open the selected application or website to send them.
+- **Codex Conversation Browser**: Browse local Codex conversations and open them in Codex Desktop.
+
+## How to Use
+
+Click Eden to open the compact chat window and type a command.
+
+**Try asking Eden:**
+
+- `Open Figma`
+- `Launch Codex and Claude`
+- `Show my Codex conversations`
+- `I want to send a message to ChatGPT`
+
+Eden also has optional advanced controls for Claude Code and Codex CLI Terminal sessions.
+
+**Note:** Guided Messaging prepares and copies your message, then opens ChatGPT or Claude. You'll select the conversation and send the message yourself.
+
+## Installation
+
+### Requirements
+
+- macOS 13 or later
+- Apple Swift command-line tools
+- A suitable signing identity for signed installation, or explicit ad hoc signing for local testing
+
+### Build
 
 ```bash
 cd "$HOME/Documents/GitHub/Eden Bot"
 bash scripts/install-local.sh --build-only
 ```
 
-This builds and validates `build/Eden.app` without installing or opening it. The script keeps the bundle identifier `io.github.jessawolfe.mochi` and uses the existing signing identity when available. It requires `assets/branding/Eden.icns` and installs that icon into the app bundle. See [branding/README.md](branding/README.md).
-
-## Install Eden when ready
-
-The local installer never launches the app. It refuses to install while `~/Applications/Katescape.app` exists because Eden uses the same bundle identifier. First quit Katescape, then move its app bundle to a backup location of your choosing. Keep that backup until Eden has been tested. Do not run the legacy `install.sh`; it belongs to the original Mochi installer and would otherwise manage Claude hooks and user settings.
-
-After retiring the old app bundle, run:
+### Install
 
 ```bash
-cd "$HOME/Documents/GitHub/Eden Bot"
 bash scripts/install-local.sh --install
 ```
 
-The script stages and verifies `~/Applications/Eden.app`. If an Eden.app already exists, it requires interactive confirmation and backs up the existing app before replacement. It does not remove Katescape.app, change account settings, or launch Eden.
+For local ad hoc signing:
 
-If no valid `Mochi Local Signing` identity exists, `--install` refuses the build. You can explicitly choose `bash scripts/install-local.sh --install --ad-hoc`; the script asks for a second confirmation. Ad hoc signing can cause macOS to ask for Automation or Accessibility permissions again after future rebuilds. The local builder does not create certificates or alter Keychain.
+```bash
+bash scripts/install-local.sh --install --ad-hoc
+```
 
-macOS may still show an existing Login Item or privacy permission under the old name until the system refreshes its registration. The bundle identifier and signing identity remain unchanged. Check **System Settings → General → Login Items** after manually switching apps, and keep only the desired entry enabled.
+The installer builds and validates `Eden.app` but does not launch it automatically.
 
-## Use
+**Migrating from Katescape:** If `~/Applications/Katescape.app` still exists, quit it and move it to a safe backup location before installing Eden. Keep the backup until Eden has been tested.
 
-- Click Eden to open or close the chat; drag the cat to reposition it; right-click for the menu.
-- Type an explicit launcher command such as `Open Figma` or `Show my Codex conversations`.
-- Type `Message Claude` or `Message ChatGPT` for a guided copy-and-open flow. Eden does not claim to send those messages automatically.
-- Use **Advanced** for optional Terminal provider and destination controls. These require an existing, verified CLI session.
+The original bundle identifier and legacy support paths are retained for compatibility. Avoid running the original `install.sh`, which manages the legacy Mochi setup.
 
-The legacy data directory at `~/Library/Application Support/Mochi` and the existing Claude hooks are intentionally unchanged by this rename.
+## Credits & Licence
 
-## Credits and licence
+**Eden** is developed and customised by [Kate Tacastacas](https://kateafable.com).
 
-Created and developed by [Kate Tacastacas](https://kateafable.com).
+Forked from **[Mochi](https://github.com/jessawolfe-ux/mochi)**, originally created by [Jessa Wolfe](https://jessa.art/).
 
-Based on the [original Mochi project](https://github.com/jessawolfe-ux/mochi), created by [Jessa Wolfe](https://jessa.art/). The repository retains the original MIT licence and Jessa Wolfe's copyright notice in [LICENSE](LICENSE).
+The original MIT licence and copyright attribution are retained in [LICENSE](LICENSE).
