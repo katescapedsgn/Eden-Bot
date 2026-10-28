@@ -4,6 +4,108 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) {
     guard condition() else { fputs("FAIL: \(message)\n", stderr); exit(1) }
 }
 
+func catFrame(_ time: Double = 0, sleepAge: Double? = nil, thinking: Bool = false,
+              asking: Bool = false, petting: Bool = false, worried: Bool = false,
+              happyAge: Double = -1, blinkAge: Double = -1,
+              waveAge: Double = -1, pettingAge: Double = -1, confusedAge: Double = -1) -> EdenAnimation.Frame {
+    EdenAnimation.select(catTime: time, sleepAge: sleepAge, thinking: thinking, asking: asking,
+                         petting: petting, worried: worried, happyAge: happyAge, blinkAge: blinkAge,
+                         waveAge: waveAge, pettingAge: pettingAge, confusedAge: confusedAge)
+}
+
+check(catFrame() == .init(kind: .idle, index: 0), "Eden defaults to idle")
+check(catFrame(0.46) == .init(kind: .idle, index: 1), "idle advances at 0.45 seconds")
+check(catFrame(1.81) == .init(kind: .idle, index: 0), "idle loops after four frames")
+for index in 0..<4 {
+    check(catFrame(blinkAge: Double(index) / 12) == .init(kind: .blink, index: index),
+          "blink frame \(index) at 12 fps")
+    check(catFrame(Double(index) * 0.3, thinking: true) == .init(kind: .thinking, index: index),
+          "thinking frame \(index)")
+    check(catFrame(happyAge: Double(index) * 0.2) == .init(kind: .happy, index: index),
+          "happy frame \(index)")
+}
+check(catFrame(blinkAge: 0.34).kind == .idle, "blink returns to idle")
+check(catFrame(happyAge: 0.8).kind == .idle, "happy finishes before returning to idle")
+check(catFrame(sleepAge: 0).index == 0 && catFrame(sleepAge: 1.2).index == 2 &&
+      catFrame(sleepAge: 7.3).index == 1, "sleep breathes and occasionally twitches ears")
+check(catFrame(sleepAge: 0, thinking: true, happyAge: 0, blinkAge: 0).kind == .sleeping,
+      "sleep takes priority")
+check(catFrame(thinking: true, happyAge: 0, blinkAge: 0).kind == .thinking,
+      "thinking takes priority over happy and blink")
+check(catFrame(thinking: true, asking: true).kind == .idle &&
+      catFrame(worried: true, happyAge: 0).kind == .idle, "question and error use neutral Eden")
+check(catFrame(petting: true, blinkAge: 0).kind == .idle, "petting keeps neutral frame")
+check(catFrame(waveAge: 0).kind == .idle && catFrame(waveAge: 0.2).kind == .wave &&
+      catFrame(waveAge: 0.6).kind == .idle && catFrame(waveAge: 0.8).kind == .idle,
+      "wave plays one idle-wave-idle sequence")
+check(catFrame(petting: true, pettingAge: 0).kind == .idle &&
+      catFrame(petting: true, pettingAge: 0.2) == .init(kind: .petting, index: 0) &&
+      catFrame(petting: true, pettingAge: 0.4) == .init(kind: .petting, index: 1) &&
+      catFrame(petting: true, pettingAge: 0.6) == .init(kind: .petting, index: 0) &&
+      catFrame(petting: true, pettingAge: 0.8).kind == .idle &&
+      catFrame(petting: false, pettingAge: 0.4).kind == .idle,
+      "petting loops while active and stops when petting ends")
+check(catFrame(confusedAge: 0).kind == .idle &&
+      catFrame(confusedAge: 0.2).kind == .confused &&
+      catFrame(confusedAge: 0.8).kind == .idle &&
+      catFrame(confusedAge: 1.0).kind == .idle,
+      "confused plays one idle-confused-idle sequence")
+check(catFrame(sleepAge: 0, waveAge: 0.3, confusedAge: 0.3).kind == .sleeping &&
+      catFrame(thinking: true, waveAge: 0.3).kind == .thinking &&
+      catFrame(petting: true, waveAge: 0.3, pettingAge: 0.3).kind == .wave &&
+      catFrame(thinking: true, waveAge: 0.3, confusedAge: 0.3).kind == .confused,
+      "sleep and error priorities prevent conflicting animations")
+check(EdenAnimation.overlays(for: catFrame(), asking: false, petting: false, worried: false).isEmpty,
+      "idle has no legacy effects")
+check(EdenAnimation.overlays(for: catFrame(blinkAge: 0), asking: false, petting: false, worried: false).isEmpty,
+      "blink has no legacy effects")
+check(EdenAnimation.overlays(for: catFrame(sleepAge: 2), asking: false, petting: false, worried: false).isEmpty,
+      "sleep sprite has no Zzz overlay")
+check(EdenAnimation.overlays(for: catFrame(thinking: true), asking: false, petting: false, worried: false).isEmpty,
+      "thinking sprite has no dots overlay")
+check(EdenAnimation.overlays(for: catFrame(happyAge: 0), asking: false, petting: false, worried: false).isEmpty,
+      "happy sprite has no sparkles overlay")
+check(EdenAnimation.overlays(for: catFrame(petting: true), asking: false, petting: true, worried: false) == [.heart],
+      "heart appears only while petting")
+check(EdenAnimation.overlays(for: catFrame(asking: true), asking: true, petting: false, worried: false) == [.question],
+      "question indicator remains")
+check(EdenAnimation.overlays(for: catFrame(worried: true), asking: false, petting: false, worried: true) == [.warning],
+      "warning indicator remains")
+check(EdenAnimation.overlays(for: catFrame(), asking: false, petting: false, worried: false).isEmpty,
+      "effects stop when their state ends")
+check(CatSprites.neutral == nil && CatSprites.image(for: catFrame()) == nil,
+      "missing artwork stays missing in an unbundled test executable")
+check(CatSprites.loadIssues.count == 23 && CatSprites.loadIssues.allSatisfy { $0.contains("missing from app bundle") },
+      "unbundled artwork reports each missing frame with a reason")
+if let path = ProcessInfo.processInfo.environment["EDEN_TEST_APP_BUNDLE"] {
+    guard let bundle = Bundle(url: URL(fileURLWithPath: path)) else {
+        fputs("FAIL: EDEN_TEST_APP_BUNDLE is not an app bundle\n", stderr); exit(1)
+    }
+    let specs: [(String, String, Int, NSSize)] = [
+        ("idle", "idle", 4, NSSize(width: 288, height: 288)),
+        ("blink", "blink", 4, NSSize(width: 288, height: 288)),
+        ("sleep", "sleeping", 3, NSSize(width: 288, height: 256)),
+        ("thinking", "thinking", 4, NSSize(width: 288, height: 288)),
+        ("happy", "happy", 4, NSSize(width: 320, height: 320)),
+        ("wave", "wave", 1, NSSize(width: 288, height: 288)),
+        ("pet", "petting", 2, NSSize(width: 288, height: 288)),
+        ("confused", "confused", 1, NSSize(width: 288, height: 288))
+    ]
+    var loadedCount = 0
+    for (name, folder, count, size) in specs {
+        let result = CatSprites.load(name, in: folder, count: count, size: size, bundle: bundle)
+        check(result.issues.isEmpty, "\(folder) sprites load: \(result.issues.joined(separator: "; "))")
+        check(result.frames.count == count && result.frames.allSatisfy { $0?.size == size },
+              "\(folder) sprites retain the expected point canvas")
+        loadedCount += result.frames.compactMap { $0 }.count
+    }
+    check(loadedCount == 23, "all 23 bundled sprites decode with Eden's loader")
+}
+check(LauncherCommandParser.isExplicitDesktopCommand("Open a file") &&
+      LauncherCommandParser.isExplicitDesktopCommand("Copy something") &&
+      !LauncherCommandParser.isExplicitDesktopCommand("Hello, Eden"),
+      "only explicit desktop command wording requests confused feedback")
+
 func makeApp(in root: URL, file: String, display: String, bundleName: String, id: String) -> URL {
     let app = root.appendingPathComponent(file + ".app", isDirectory: true)
     let contents = app.appendingPathComponent("Contents", isDirectory: true)
@@ -17,23 +119,69 @@ func makeApp(in root: URL, file: String, display: String, bundleName: String, id
 
 let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("eden-launcher-tests-\(UUID().uuidString)")
 let screen = NSRect(x: 0, y: 0, width: 800, height: 600)
-let petFrame = NSRect(x: 100, y: 20, width: 144, height: 144)
-let chatFrame = PetChatLayout.targetFrame(current: petFrame, wasOpen: false, willOpen: true,
-                                          size: NSSize(width: 340, height: 168), visible: screen)
+let petFrame = NSRect(x: 100, y: 20, width: 96, height: 96)
+let chatSize = NSSize(width: 340, height: 168)
+let chatFrame = PetChatLayout.chatFrame(pet: petFrame, size: chatSize, visible: screen)
 check(chatFrame.width == 340 && chatFrame.height == 168, "compact chat dimensions")
-check(chatFrame.minX == 144 && chatFrame.minY == 20, "chat stays anchored near pet")
-let collapsedAgain = PetChatLayout.targetFrame(current: chatFrame, wasOpen: true, willOpen: false,
-                                                size: NSSize(width: 144, height: 144), visible: screen)
-check(collapsedAgain == petFrame, "collapse returns to pet position")
-let edgeChat = PetChatLayout.targetFrame(current: NSRect(x: 760, y: 520, width: 144, height: 144),
-                                         wasOpen: false, willOpen: true,
-                                         size: NSSize(width: 340, height: 168), visible: screen)
-check(edgeChat.maxX <= screen.maxX - 8 && edgeChat.maxY <= screen.maxY - 8,
-      "chat stays inside visible screen edges")
-let edgePet = PetChatLayout.targetFrame(current: edgeChat, wasOpen: true, willOpen: false,
-                                        size: NSSize(width: 144, height: 144), visible: screen)
-check(edgePet.maxX <= screen.maxX - 8 && edgePet.maxY <= screen.maxY - 8,
-      "collapsed pet stays inside visible screen edges")
+check(chatFrame.minX == petFrame.maxX + 8 && chatFrame.minY == petFrame.minY,
+      "chat opens beside the stationary pet")
+for _ in 0..<100 {
+    check(PetChatLayout.chatFrame(pet: petFrame, size: chatSize, visible: screen) == chatFrame,
+          "repeated chat toggles do not accumulate position drift")
+}
+check(PetChatLayout.petFrame(petFrame, visible: screen) == petFrame,
+      "existing pet position is preserved")
+let edgePets = [NSRect(x: 8, y: 200, width: 96, height: 96),
+                NSRect(x: 696, y: 200, width: 96, height: 96),
+                NSRect(x: 300, y: 8, width: 96, height: 96),
+                NSRect(x: 300, y: 496, width: 96, height: 96)]
+for pet in edgePets {
+    let chat = PetChatLayout.chatFrame(pet: pet, size: chatSize, visible: screen)
+    check(chat.minX >= screen.minX + 8 && chat.maxX <= screen.maxX - 8 &&
+          chat.minY >= screen.minY + 8 && chat.maxY <= screen.maxY - 8,
+          "chat fits near every screen edge without moving the pet")
+}
+check(PetChatLayout.chatFrame(pet: edgePets[1], size: chatSize, visible: screen).maxX == edgePets[1].minX - 8,
+      "chat flips to the left at the right edge")
+let narrow = NSRect(x: 0, y: 0, width: 420, height: 600)
+check(PetChatLayout.chatFrame(pet: NSRect(x: 160, y: 180, width: 96, height: 96),
+                              size: chatSize, visible: narrow).minY == 284,
+      "chat moves above the pet when neither side fits")
+check(PetChatLayout.chatFrame(pet: NSRect(x: 160, y: 450, width: 96, height: 96),
+                              size: chatSize, visible: narrow).maxY == 442,
+      "chat moves below the pet when above does not fit")
+let secondScreen = NSRect(x: 800, y: -200, width: 1200, height: 900)
+let secondPet = NSRect(x: 950, y: -180, width: 96, height: 96)
+let secondChat = PetChatLayout.chatFrame(pet: secondPet, size: chatSize, visible: secondScreen)
+check(secondChat.minX >= secondScreen.minX + 8 && secondChat.maxX <= secondScreen.maxX - 8 &&
+      secondChat.minY >= secondScreen.minY + 8 && secondChat.maxY <= secondScreen.maxY - 8,
+      "chat uses the second display's point coordinates")
+let smallVisible = NSRect(x: 0, y: 0, width: 420, height: 300)
+let quickHeight: CGFloat = min(QuickChatLayout.height(for: .selecting(.open), hasBadges: false),
+                               max(168, smallVisible.height - 16))
+let smallPet = NSRect(x: 160, y: 100, width: 96, height: 96)
+let quickChat = PetChatLayout.chatFrame(pet: smallPet,
+    size: NSSize(width: 340, height: quickHeight), visible: smallVisible)
+check(quickChat.width == 340 && quickChat.height == 284 &&
+      quickChat.minY >= 8 && quickChat.maxY <= smallVisible.maxY - 8,
+      "Quick Actions chat is height-clamped on a small screen")
+check(smallPet == NSRect(x: 160, y: 100, width: 96, height: 96),
+      "Quick Actions height does not move the pet")
+let homeHeight = QuickChatLayout.height(for: .home, hasBadges: false)
+let homeHeading = QuickChatLayout.headingY(height: homeHeight, hasBadges: false)
+let homeButtons = QuickChatLayout.scrollFrame(height: homeHeight, hasBadges: false)
+check(homeHeight == 275 && homeButtons.height == 100 && homeButtons.width == 308,
+      "Quick Actions home fits the compact chat")
+check(homeHeight - 31 - (homeHeading + 17) == 16 &&
+      homeHeading - homeButtons.maxY == 12 &&
+      QuickChatLayout.buttonRowGap == 8 &&
+      QuickChatLayout.buttonsBottom - QuickChatLayout.input.maxY == 16 &&
+      QuickChatLayout.input.minY == 16,
+      "Quick Actions vertical spacing matches the compact layout")
+check(QuickChatLayout.height(for: .selecting(.copy), hasBadges: false) == 262 &&
+      QuickChatLayout.height(for: .selecting(.open), hasBadges: false) == 390 &&
+      QuickChatLayout.height(for: .home, hasBadges: true) == 295,
+      "guided actions and badges retain enough vertical space")
 let standard = scratch.appendingPathComponent("Applications")
 let outside = scratch.appendingPathComponent("Elsewhere")
 try! FileManager.default.createDirectory(at: standard, withIntermediateDirectories: true)
@@ -73,10 +221,51 @@ check(guided.capture("Revised message"), "capture edited draft")
 check(guided.state == .confirming(.chatGPT, "Revised message"), "edited confirmation")
 guided.cancel()
 check(guided.state == .idle, "cancel confirmation")
+var quick = QuickActionFlow()
+check(quick.state == .home, "quick actions start at home")
+for action in QuickActionFlow.Action.allCases {
+    quick.begin(action)
+    check(quick.state == .selecting(action), "quick action selects \(action.title)")
+    quick.back()
+    check(quick.state == .home, "Back returns from \(action.title)")
+    quick.begin(action)
+    quick.cancel()
+    check(quick.state == .home, "Cancel returns from \(action.title)")
+}
+check(QuickActionFlow.Action.open.appAction != nil && QuickActionFlow.Action.copy.appAction == nil,
+      "quick actions separate app and non-app operations")
 check(parser.parse("Open Photoshop") == .open(["Photoshop"]), "open parser")
 check(parser.parse("Launch Godot") == .open(["Godot"]), "launch parser")
 check(parser.parse("Open Spotify and Discord") == .open(["Spotify", "Discord"]), "multiple apps")
-check(parser.parse("Switch to Safari") == .open(["Safari"]), "switch parser")
+check(parser.parse("Switch to Safari") == .switchTo(["Safari"]), "switch parser")
+check(parser.parse("Hide Safari") == .hide(["Safari"]), "hide parser")
+check(parser.parse("Quit Figma") == .quit(["Figma"]), "quit parser")
+check(parser.parse("Close Spotify") == .message, "close is not confused with quit")
+check(parser.parse("Hide Spotify and Discord") == .hide(["Spotify", "Discord"]), "multiple hide targets")
+check(parser.parse("Open Desktop") == .folder(.desktop), "Desktop folder")
+check(parser.parse("Open Documents") == .folder(.documents), "Documents folder")
+check(parser.parse("Open Downloads") == .folder(.downloads), "Downloads folder")
+check(parser.parse("Open Applications") == .folder(.applications), "Applications folder")
+check(parser.parse("Open Eden Bot project folder") == .folder(.edenProject), "configured project folder")
+check(parser.parse("Open YouTube") == .website(.youtube), "YouTube allowlist")
+check(parser.parse("Open Google") == .website(.google), "Google allowlist")
+check(parser.parse("Open Wikipedia") == .website(.wikipedia), "Wikipedia allowlist")
+check(parser.parse("Open GitHub") == .website(.github), "GitHub allowlist")
+check(DesktopWebsite.youtube.url.scheme == "https", "allowlisted sites use HTTPS")
+check(parser.parse("Show Desktop") == .showDesktopUnavailable, "unsupported Show Desktop is explicit")
+check(parser.parse("Copy text: Hello, Eden!") == .copy("Hello, Eden!"), "explicit clipboard text")
+check(parser.parse("Copy hello to clipboard") == .copy("hello"), "clipboard suffix")
+check(parser.parse("Copy text: https://example.com") == .copy("https://example.com"), "clipboard text is data")
+check(parser.parse("Copy") == .message, "copy without text is not executed")
+check(parser.parse("Open example.com") == .open(["example.com"]), "unknown site is not opened as a URL")
+check(parser.parse("Open https://example.com") == .invalidAppReference, "arbitrary website is rejected")
+let projectHome = scratch.appendingPathComponent("home", isDirectory: true)
+let projectPath = projectHome.appendingPathComponent("Documents/GitHub/Eden Bot", isDirectory: true)
+try! FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+check(EdenProjectLocation.resolve(configured: nil, home: projectHome) == projectPath,
+      "existing Eden project fallback")
+check(EdenProjectLocation.resolve(configured: "/missing/eden-project", home: projectHome) == nil,
+      "missing configured project does not open a different folder")
 check(parser.parse("Open VS Code") == .open(["VS Code"]), "multiword alias")
 check(parser.parse("Open Photos") == .open(["Photos"]), "photos parser")
 check(parser.parse("Open Spotify and Spotify") == .open(["Spotify"]), "duplicate names")
@@ -153,4 +342,4 @@ check(LauncherAppDiscovery.sameLocation(spotifyURL, spotifyURL), "running app pa
 check(!LauncherAppDiscovery.sameLocation(spotifyURL, safariURL), "different running app must not match")
 
 try! FileManager.default.removeItem(at: scratch)
-print("Launcher parser and resolver tests passed")
+print("Launcher, resolver and Eden animation tests passed")

@@ -38,7 +38,7 @@ plist_value() { "$PLIST_BUDDY" -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/nu
 
 sprite_paths() {
   local spec folder prefix count number
-  for spec in idle:idle:4 blink:blink:4 sleeping:sleep:3 thinking:thinking:4 happy:happy:4; do
+  for spec in idle:idle:4 blink:blink:4 sleeping:sleep:3 thinking:thinking:4 happy:happy:4 wave:wave:1 petting:pet:2 confused:confused:1; do
     IFS=: read -r folder prefix count <<< "$spec"
     for ((number=1; number<=count; number++)); do
       printf '%s/%s_%02d.png\n' "$folder" "$prefix" "$number"
@@ -74,7 +74,7 @@ validate_cat_sprites() {
     [[ -s "$source" && -s "$bundled" ]] || return 1
     cmp -s "$source" "$bundled" || return 1
   done < <(sprite_paths)
-  [[ "$(find "$app/Contents/Resources/PetSprites/Eden" -type f -name '*.png' | wc -l | tr -d ' ')" == 19 ]]
+  [[ "$(find "$app/Contents/Resources/PetSprites/Eden" -type f -name '*.png' | wc -l | tr -d ' ')" == 23 ]]
 }
 
 command -v swiftc >/dev/null || die "swiftc is unavailable. Install Apple's Command Line Tools separately."
@@ -82,7 +82,7 @@ command -v swiftc >/dev/null || die "swiftc is unavailable. Install Apple's Comm
 SDK="$(xcrun --show-sdk-path)" || die "Could not locate the active macOS SDK."
 [[ -f "$ICON_SOURCE" && -s "$ICON_SOURCE" ]] || die "Eden icon is missing or empty: $ICON_SOURCE"
 sips -g format "$ICON_SOURCE" 2>/dev/null | grep -q 'format: icns' || die "Icon is not a valid .icns file: $ICON_SOURCE"
-[[ "$(find "$REPO/assets/sprites/eden" -type f -name '*.png' | wc -l | tr -d ' ')" == 19 ]] || die "Expected exactly 19 Eden animation sprites."
+[[ "$(find "$REPO/assets/sprites/eden" -type f -name '*.png' | wc -l | tr -d ' ')" == 23 ]] || die "Expected exactly 23 Eden animation sprites."
 while IFS= read -r RELATIVE; do
   SPRITE="$REPO/assets/sprites/eden/$RELATIVE"
   [[ -s "$SPRITE" ]] || die "Missing pet sprite: $SPRITE"
@@ -142,10 +142,14 @@ cmp -s "$ICON_SOURCE" "$APP/Contents/Resources/$ICON_NAME" || die "Built app ico
 
 SIGNED=false
 if [[ "$AD_HOC" == true ]]; then
+  # Copied PNGs may carry FinderInfo or resource-fork metadata that codesign rejects.
+  # Clean only the temporary app bundle; leave source artwork and earlier builds intact.
+  xattr -cr "$APP" || die "Could not remove extended attributes from the staged app."
   codesign --force --sign - "$APP" || die "Ad hoc signing failed."
   codesign --verify --deep --strict "$APP" || die "Ad hoc signature verification failed."
   SIGNED=true
 elif security find-identity -v -p codesigning | grep -Fq "\"$IDENTITY\""; then
+  xattr -cr "$APP" || die "Could not remove extended attributes from the staged app."
   codesign --force --sign "$IDENTITY" "$APP" || die "Signing failed for '$IDENTITY'. No ad hoc signature was used."
   codesign --verify --deep --strict "$APP" || die "Code signature verification failed."
   SIGNED=true

@@ -8,20 +8,23 @@ Originally forked from [Mochi](https://github.com/jessawolfe-ux/mochi) by [Jessa
 
 ## Features
 
-- **Desktop Cat**: A lavender pixel-art companion with expressive animations. Click to chat, drag to reposition and right-click for more options.
-- **App Launcher**: Open installed Mac applications using natural-language commands, such as `Open Figma and Codex`.
-- **Guided AI Messaging**: Compose messages for ChatGPT or Claude, then open the selected application or website to send them.
-- **Codex Conversation Browser**: Browse local Codex conversations and open them in Codex Desktop.
+- **Desktop Cat**: A lavender pixel-art companion with idle, blink, sleeping, thinking and happy animations. Click to chat, drag to reposition and right-click for more options.
+- **Quick Actions**: Use Open, Switch, Hide, Quit, Copy and Message buttons for guided desktop tasks.
+- **Desktop Commands**: Type natural-language commands to open, switch, hide or gracefully quit apps, open common Finder folders, copy text or visit supported websites.
+- **Guided AI Messaging**: Compose and copy a message, then open ChatGPT or Claude. You choose the conversation and send it yourself.
+- **Codex Conversation Browser**: Browse existing local Codex threads and open them in Codex Desktop.
 
 ## How to Use
 
-Click Eden to open the compact chat window and type a command.
+Click Eden to open the compact chat window. Choose a Quick Action or type a desktop command.
 
 **Try asking Eden:**
 
-- `Open Figma`
-- `Launch Codex and Claude`
-- `Show my Codex conversations`
+- `Open Figma and Codex`
+- `Switch to Safari`
+- `Open Downloads`
+- `Hide Spotify`
+- `Copy text: hello world`
 - `I want to send a message to ChatGPT`
 
 Eden also has optional advanced controls for Claude Code and Codex CLI Terminal sessions.

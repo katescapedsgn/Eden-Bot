@@ -59,16 +59,31 @@ final class PetHandle: NSView {
 }
 
 enum PetChatLayout {
-    static func targetFrame(current: NSRect, wasOpen: Bool, willOpen: Bool,
-                            size: NSSize, visible: NSRect?) -> NSRect {
-        let catCenter = current.minX + (wasOpen ? 28 : current.width / 2)
-        var frame = NSRect(x: catCenter - (willOpen ? 28 : size.width / 2), y: current.minY,
-                           width: size.width, height: size.height)
-        if let visible {
-            frame.origin.x = min(max(frame.minX, visible.minX + 8), visible.maxX - size.width - 8)
-            frame.origin.y = min(max(frame.minY, visible.minY + 8), visible.maxY - size.height - 8)
-        }
-        return frame
+    static func petFrame(_ frame: NSRect, visible: NSRect?) -> NSRect {
+        guard let visible else { return frame }
+        var result = frame
+        result.origin.x = min(max(frame.minX, visible.minX + 8), visible.maxX - frame.width - 8)
+        result.origin.y = min(max(frame.minY, visible.minY + 8), visible.maxY - frame.height - 8)
+        return result
+    }
+
+    static func chatFrame(pet: NSRect, size: NSSize, visible: NSRect?) -> NSRect {
+        let gap: CGFloat = 8
+        let right = pet.maxX + gap
+        let left = pet.minX - gap - size.width
+        let centred = pet.midX - size.width / 2
+        guard let visible else { return NSRect(origin: NSPoint(x: right, y: pet.minY), size: size) }
+        let minX = visible.minX + gap, maxX = visible.maxX - gap - size.width
+        let minY = visible.minY + gap, maxY = visible.maxY - gap - size.height
+        let sideY = min(max(pet.minY, minY), maxY)
+        if right <= maxX { return NSRect(origin: NSPoint(x: right, y: sideY), size: size) }
+        if left >= minX { return NSRect(origin: NSPoint(x: left, y: sideY), size: size) }
+        let centredX = min(max(centred, minX), maxX)
+        let above = pet.maxY + gap
+        if above <= maxY { return NSRect(origin: NSPoint(x: centredX, y: above), size: size) }
+        let below = pet.minY - gap - size.height
+        if below >= minY { return NSRect(origin: NSPoint(x: centredX, y: below), size: size) }
+        return NSRect(origin: NSPoint(x: centredX, y: sideY), size: size)
     }
 }
 
@@ -89,7 +104,69 @@ enum LauncherCommand: Equatable {
     case message
     case browseCodexThreads
     case open([String])
+    case switchTo([String])
+    case hide([String])
+    case quit([String])
+    case folder(DesktopFolder)
+    case website(DesktopWebsite)
+    case copy(String)
+    case showDesktopUnavailable
     case invalidAppReference
+}
+
+enum DesktopFolder: String, Equatable {
+    case desktop, documents, downloads, applications, edenProject
+
+    static let allQuickCases: [DesktopFolder] = [.desktop, .documents, .downloads, .applications, .edenProject]
+
+    static func named(_ name: String) -> DesktopFolder? {
+        switch name.lowercased() {
+        case "desktop": return .desktop
+        case "documents": return .documents
+        case "downloads": return .downloads
+        case "applications": return .applications
+        case "eden bot project folder", "eden bot project", "eden project folder", "eden project": return .edenProject
+        default: return nil
+        }
+    }
+
+    var title: String { self == .edenProject ? "Eden Bot project" : rawValue.capitalized }
+}
+
+enum DesktopWebsite: String, Equatable {
+    case youtube, google, wikipedia, github
+
+    static func named(_ name: String) -> DesktopWebsite? {
+        switch name.lowercased() {
+        case "youtube", "youtube website": return .youtube
+        case "google", "google website": return .google
+        case "wikipedia", "wikipedia website": return .wikipedia
+        case "github", "github website": return .github
+        default: return nil
+        }
+    }
+
+    var url: URL {
+        let address: String
+        switch self {
+        case .youtube: address = "https://www.youtube.com/"
+        case .google: address = "https://www.google.com/"
+        case .wikipedia: address = "https://www.wikipedia.org/"
+        case .github: address = "https://github.com/"
+        }
+        return URL(string: address)!
+    }
+
+    var title: String { rawValue.capitalized }
+}
+
+enum EdenProjectLocation {
+    static func resolve(configured: String?, home: URL) -> URL? {
+        let fallback = home.appendingPathComponent("Documents/GitHub/Eden Bot", isDirectory: true)
+        let candidate = configured.flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil } ?? fallback
+        guard (try? candidate.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return nil }
+        return candidate.standardizedFileURL
+    }
 }
 
 enum GuidedMessageDestination: String, Equatable {
@@ -147,22 +224,115 @@ struct GuidedMessageFlow {
     mutating func cancel() { state = .idle }
 }
 
+struct QuickActionFlow {
+    enum Action: Int, CaseIterable {
+        case open, switchTo, hide, quit, copy, message
+
+        var title: String {
+            switch self {
+            case .open: return "Open"
+            case .switchTo: return "Switch"
+            case .hide: return "Hide"
+            case .quit: return "Quit"
+            case .copy: return "Copy"
+            case .message: return "Message"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .open: return "square.and.arrow.up"
+            case .switchTo: return "arrow.right.square"
+            case .hide: return "eye.slash"
+            case .quit: return "power"
+            case .copy: return "doc.on.doc"
+            case .message: return "bubble.left"
+            }
+        }
+        var appAction: DesktopAppAction? {
+            switch self {
+            case .open: return .open
+            case .switchTo: return .switchTo
+            case .hide: return .hide
+            case .quit: return .quit
+            case .copy, .message: return nil
+            }
+        }
+    }
+
+    enum State: Equatable { case home, selecting(Action) }
+    private(set) var state: State = .home
+    mutating func begin(_ action: Action) { state = .selecting(action) }
+    mutating func back() { state = .home }
+    mutating func cancel() { state = .home }
+}
+
+enum QuickChatLayout {
+    static let input = NSRect(x: 12, y: 16, width: 316, height: 67)
+    static let inputText = NSRect(x: 19, y: 22, width: 302, height: 55)
+    static let buttonSize = NSSize(width: 98, height: 46)
+    static let buttonRowGap: CGFloat = 8
+    static let buttonsBottom: CGFloat = 99
+
+    static func height(for state: QuickActionFlow.State, hasBadges: Bool) -> CGFloat {
+        let base: CGFloat
+        switch state {
+        case .home: base = 275
+        case .selecting(.open), .selecting(.switchTo), .selecting(.hide), .selecting(.quit): base = 390
+        case .selecting(.copy), .selecting(.message): base = 262
+        }
+        return base + (hasBadges ? 20 : 0)
+    }
+
+    static func headingY(height: CGFloat, hasBadges: Bool) -> CGFloat {
+        height - 64 - (hasBadges ? 20 : 0)
+    }
+
+    static func scrollFrame(height: CGFloat, hasBadges: Bool) -> NSRect {
+        NSRect(x: 16, y: buttonsBottom, width: 308,
+               height: max(36, headingY(height: height, hasBadges: hasBadges) - 12 - buttonsBottom))
+    }
+}
+
 struct LauncherCommandParser {
+    static func isExplicitDesktopCommand(_ input: String) -> Bool {
+        input.trimmingCharacters(in: .whitespacesAndNewlines)
+            .range(of: #"^(?:open|launch|start|switch to|hide|quit|show|copy)\s+"#,
+                   options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     func parse(_ input: String) -> LauncherCommand {
-        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let original = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = original
         guard !text.hasSuffix("?") else { return .message }
+        if let match = original.range(of: #"^copy(?: text)?(?: to (?:the )?clipboard)?\s*:\s*"#, options: [.regularExpression, .caseInsensitive]),
+           match.lowerBound == original.startIndex {
+            let body = String(original[match.upperBound...])
+            return body.isEmpty ? .message : .copy(body)
+        }
+        if let match = original.range(of: #"^copy\s+.+\s+to (?:the )?clipboard$"#, options: [.regularExpression, .caseInsensitive]),
+           match.lowerBound == original.startIndex {
+            let body = original.replacingOccurrences(of: #"^copy\s+|\s+to (?:the )?clipboard$"#, with: "",
+                options: [.regularExpression, .caseInsensitive])
+                .trimmingCharacters(in: .whitespaces)
+            return body.isEmpty ? .message : .copy(body)
+        }
         text = text.trimmingCharacters(in: CharacterSet(charactersIn: ".!"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = text.lowercased()
+        if lower == "show desktop" || lower == "show my desktop" { return .showDesktopUnavailable }
         if lower == "show my codex conversations" || lower == "show codex conversations"
             || lower == "show my codex threads" || lower == "show codex threads" {
             return .browseCodexThreads
         }
-        guard let match = lower.range(of: #"^(?:open|launch|start|switch to|show)\s+"#, options: .regularExpression) else {
+        guard let match = lower.range(of: #"^(?:open|launch|start|switch to|show|hide|quit)\s+"#, options: .regularExpression) else {
             return .message
         }
         let verb = lower[..<match.upperBound].trimmingCharacters(in: .whitespaces)
-        let body = String(text[match.upperBound...])
+        let body = String(text[match.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if verb == "open" || verb == "show" || verb == "launch" {
+            if let folder = DesktopFolder.named(body) { return .folder(folder) }
+            if let website = DesktopWebsite.named(body) { return .website(website) }
+        }
         let separated = body.replacingOccurrences(of: #"\s+(?:and|&)\s+"#, with: ",", options: [.regularExpression, .caseInsensitive])
         let parts = separated.split(separator: ",", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -185,7 +355,12 @@ struct LauncherCommandParser {
         for part in parts where !unique.contains(where: { $0.caseInsensitiveCompare(part) == .orderedSame }) {
             unique.append(part)
         }
-        return .open(unique)
+        switch verb {
+        case "switch to": return .switchTo(unique)
+        case "hide": return .hide(unique)
+        case "quit": return .quit(unique)
+        default: return .open(unique)
+        }
     }
 }
 
@@ -227,6 +402,19 @@ enum LauncherResolution: Equatable {
     case alias([InstalledApplication])
     case suggestions([InstalledApplication])
     case missing
+}
+
+enum DesktopAppAction {
+    case open, switchTo, hide, quit
+
+    var choiceVerb: String {
+        switch self {
+        case .open: return "Open"
+        case .switchTo: return "Switch to"
+        case .hide: return "Hide"
+        case .quit: return "Quit"
+        }
+    }
 }
 
 struct LauncherAppResolver {
@@ -782,23 +970,126 @@ func saveColor(_ c: NSColor) {
 }
 var mochiGoo = gooColors(savedColor())
 
-// Bundle sprites are optional so PB_PET_ART=mochi remains a development-only visual fallback.
-private enum CatSprites {
-    static func load(_ name: String, in state: String, count: Int, size: NSSize) -> [NSImage] {
-        (1...count).compactMap { number in
-            guard let url = Bundle.main.url(forResource: String(format: "%@_%02d", name, number),
-                                            withExtension: "png", subdirectory: "PetSprites/Eden/\(state)"),
-                  let image = NSImage(contentsOf: url), image.size == size else { return nil }
-            return image
+// Frame selection is independent of resource loading, so missing artwork cannot change the pet's identity.
+enum EdenAnimation {
+    enum Kind: Equatable { case idle, blink, sleeping, thinking, happy, wave, petting, confused }
+    struct Frame: Equatable { let kind: Kind; let index: Int }
+    enum Overlay: Hashable { case heart, question, warning }
+
+    static func select(catTime: Double, sleepAge: Double?, thinking: Bool, asking: Bool,
+                       petting: Bool, worried: Bool, happyAge: Double, blinkAge: Double,
+                       waveAge: Double = -1, pettingAge: Double = -1, confusedAge: Double = -1) -> Frame {
+        if let sleepAge {
+            // Slow breathing between frames 1 and 3; ears rise briefly once every eight seconds.
+            let index = sleepAge.truncatingRemainder(dividingBy: 8) >= 7.2 ? 1 :
+                (Int(sleepAge / 1.2) % 2 == 0 ? 0 : 2)
+            return Frame(kind: .sleeping, index: index)
         }
+        if asking { return Frame(kind: .idle, index: 0) }
+        if confusedAge >= 0 && confusedAge < 1.0 {
+            return Frame(kind: confusedAge < 0.2 || confusedAge >= 0.8 ? .idle : .confused, index: 0)
+        }
+        if worried { return Frame(kind: .idle, index: 0) }
+        if thinking { return Frame(kind: .thinking, index: Int(catTime / 0.3) % 4) }
+        if waveAge >= 0 && waveAge < 0.8 {
+            return Frame(kind: waveAge < 0.2 || waveAge >= 0.6 ? .idle : .wave, index: 0)
+        }
+        if petting {
+            let phase = max(0, pettingAge).truncatingRemainder(dividingBy: 0.8)
+            if phase < 0.2 { return Frame(kind: .idle, index: 0) }
+            return Frame(kind: .petting, index: phase < 0.4 || phase >= 0.6 ? 0 : 1)
+        }
+        if happyAge >= 0 && happyAge < 0.8 {
+            return Frame(kind: .happy, index: min(3, Int(happyAge / 0.2)))
+        }
+        if blinkAge >= 0 && blinkAge < 4.0 / 12.0 {
+            return Frame(kind: .blink, index: min(3, Int(blinkAge * 12)))
+        }
+        return Frame(kind: .idle, index: Int(catTime / 0.45) % 4)
     }
-    static let idle = load("idle", in: "idle", count: 4, size: NSSize(width: 288, height: 288))
-    static let blink = load("blink", in: "blink", count: 4, size: NSSize(width: 288, height: 288))
-    static let sleeping = load("sleep", in: "sleeping", count: 3, size: NSSize(width: 288, height: 256))
-    static let thinking = load("thinking", in: "thinking", count: 4, size: NSSize(width: 288, height: 288))
-    static let happy = load("happy", in: "happy", count: 4, size: NSSize(width: 320, height: 320))
-    static var available: Bool {
-        idle.count == 4 && blink.count == 4 && sleeping.count == 3 && thinking.count == 4 && happy.count == 4
+
+    static func overlays(for frame: Frame, asking: Bool, petting: Bool, worried: Bool) -> Set<Overlay> {
+        guard frame.kind == .idle else { return [] }
+        if asking { return [.question] }
+        if worried { return [.warning] }
+        return petting ? [.heart] : []
+    }
+}
+
+enum CatSprites {
+    struct LoadResult {
+        let frames: [NSImage?]
+        let issues: [String]
+    }
+
+    static func load(_ name: String, in state: String, count: Int, size: NSSize,
+                     bundle: Bundle = .main) -> LoadResult {
+        var frames: [NSImage?] = []
+        var issues: [String] = []
+        for number in 1...count {
+            let filename = String(format: "%@_%02d.png", name, number)
+            let label = "\(state)/\(filename)"
+            guard let url = bundle.url(forResource: String(format: "%@_%02d", name, number),
+                                       withExtension: "png", subdirectory: "PetSprites/Eden/\(state)") else {
+                frames.append(nil); issues.append("\(label): missing from app bundle"); continue
+            }
+            guard let data = try? Data(contentsOf: url), let bitmap = NSBitmapImageRep(data: data),
+                  let image = NSImage(contentsOf: url), image.isValid else {
+                frames.append(nil); issues.append("\(label): PNG could not be decoded"); continue
+            }
+            guard bitmap.pixelsWide == Int(size.width), bitmap.pixelsHigh == Int(size.height) else {
+                frames.append(nil)
+                issues.append("\(label): \(bitmap.pixelsWide)×\(bitmap.pixelsHigh) pixels; expected \(Int(size.width))×\(Int(size.height))")
+                continue
+            }
+            guard bitmap.hasAlpha else {
+                frames.append(nil); issues.append("\(label): no alpha channel"); continue
+            }
+            // NSImage.size is in points and reflects PNG DPI. Use the verified pixel canvas
+            // so 300 DPI sprites render beside 72 DPI sprites at the same on-screen size.
+            image.size = size
+            frames.append(image)
+        }
+        return LoadResult(frames: frames, issues: issues)
+    }
+    static let idleLoad = load("idle", in: "idle", count: 4, size: NSSize(width: 288, height: 288))
+    static let blinkLoad = load("blink", in: "blink", count: 4, size: NSSize(width: 288, height: 288))
+    static let sleepingLoad = load("sleep", in: "sleeping", count: 3, size: NSSize(width: 288, height: 256))
+    static let thinkingLoad = load("thinking", in: "thinking", count: 4, size: NSSize(width: 288, height: 288))
+    static let happyLoad = load("happy", in: "happy", count: 4, size: NSSize(width: 320, height: 320))
+    static let waveLoad = load("wave", in: "wave", count: 1, size: NSSize(width: 288, height: 288))
+    static let pettingLoad = load("pet", in: "petting", count: 2, size: NSSize(width: 288, height: 288))
+    static let confusedLoad = load("confused", in: "confused", count: 1, size: NSSize(width: 288, height: 288))
+    static let idle = idleLoad.frames
+    static let blink = blinkLoad.frames
+    static let sleeping = sleepingLoad.frames
+    static let thinking = thinkingLoad.frames
+    static let happy = happyLoad.frames
+    static let wave = waveLoad.frames
+    static let petting = pettingLoad.frames
+    static let confused = confusedLoad.frames
+    static let loadIssues = [idleLoad, blinkLoad, sleepingLoad, thinkingLoad, happyLoad,
+                             waveLoad, pettingLoad, confusedLoad].flatMap(\.issues)
+    static let neutral: NSImage? = {
+        if let image = idle.compactMap({ $0 }).first { return image }
+        for frames in [blink, sleeping, thinking, happy, wave, petting, confused] {
+            if let image = frames.compactMap({ $0 }).first { return image }
+        }
+        return nil
+    }()
+    static func image(for frame: EdenAnimation.Frame) -> NSImage? {
+        let frames: [NSImage?]
+        switch frame.kind {
+        case .idle: frames = idle
+        case .blink: frames = blink
+        case .sleeping: frames = sleeping
+        case .thinking: frames = thinking
+        case .happy: frames = happy
+        case .wave: frames = wave
+        case .petting: frames = petting
+        case .confused: frames = confused
+        }
+        return frames.indices.contains(frame.index) ? (frames[frame.index] ?? neutral) : neutral
     }
 }
 
@@ -809,13 +1100,16 @@ final class Goo: NSView {
     var t = 0.0
     var colors = mochiGoo { didSet { layer?.shadowColor = colors.body.cgColor } }
     var thinking = false
+    var processing = false
     var asking = false                   // Claude asked a question: a little "?" over its head
     var fed = 0                          // messages sent today: a little rounder with each
     var hopT = -10.0, hops = 1
     var sparkT = -10.0, worryT = -10.0, throwT = -10.0, heartT = -10.0
     var lean = 0.0, leanV = 0.0          // springy sway, for wiggles and flings
     var nextBlink = 2.5, blinkT = -10.0
-    var catTime = 0.0, catNextBlink = 6.0, catBlinkStart = -10.0
+    var catTime = 0.0, catNextBlink = 6.0, catBlinkStart = -10.0, catHappyStart = -10.0
+    var catWaveStart = -10.0, catConfusedStart = -10.0
+    var catPetStart: Double? = nil
     var look = 0.0, lookTo = 0.0, lookY = 0, nextLook = 4.0, greetUntil = -10.0
     var lastActive = 0.0, sleepSince: Double? = nil
     var hoverSince: Double? = nil
@@ -823,7 +1117,7 @@ final class Goo: NSView {
 
     // for testing the outfits: PB_HOUR=8 or PB_WEEKDAY=6 (Friday) in the environment
     let env = ProcessInfo.processInfo.environment
-    var useCat: Bool { env["PB_PET_ART"] != "mochi" && CatSprites.available }
+    var useCat: Bool { env["PB_PET_ART"] != "mochi" }
     var catDrawSize: CGFloat = 28
 
     override init(frame: NSRect) {
@@ -838,8 +1132,10 @@ final class Goo: NSView {
 
     // things that happen to it
     func hop(_ n: Int = 1) { hopT = t; hops = n; wake() }
-    func proud() { hop(2); sparkT = t }
-    func worry() { worryT = t; leanV += 1.2; wake() }
+    func proud() { hop(2); sparkT = t; happy() }
+    func happy() { catHappyStart = catTime; wake() }
+    func worry() { worryT = t; catConfusedStart = catTime; leanV += 1.2; wake() }
+    func wave() { wake(); catWaveStart = catTime }
     func throwIt() { throwT = t; wake() }
     func fling(_ vx: Double) { leanV += max(-2.2, min(2.2, -vx / 500)); wake() }
     func greet() { hop(); lookTo = 1; greetUntil = t + 2.5 }
@@ -865,12 +1161,13 @@ final class Goo: NSView {
         let m = NSEvent.mouseLocation
         var near = false, over = false
         if let w = window {
-            let c = w.convertPoint(toScreen: convert(NSPoint(x: bounds.midX - 4, y: bounds.midY), to: nil))
+            let enlargedCat = useCat && catDrawSize > 28
+            let c = w.convertPoint(toScreen: convert(NSPoint(x: bounds.midX - (enlargedCat ? 0 : 4), y: bounds.midY), to: nil))
             let dx = m.x - c.x, dy = m.y - c.y
             near = dx * dx + dy * dy < 260 * 260
             if near && t > greetUntil { lookTo = max(-1, min(1, dx / 70)); lookY = dy > 40 ? 1 : dy < -40 ? -1 : 0 }
-            let enlargedCat = useCat && catDrawSize > 28
-            over = abs(dx) < (enlargedCat ? 54 : 15) && abs(dy) < (enlargedCat ? 58 : 14)
+            over = abs(dx) < (enlargedCat ? catDrawSize * 0.42 : 15)
+                && abs(dy) < (enlargedCat ? catDrawSize * 0.46 : 14)
         }
         if !near && t > greetUntil {
             lookY = 0
@@ -884,15 +1181,18 @@ final class Goo: NSView {
             wake()
             if t - hoverSince! > 2.2 && t - heartT > 2.6 { heartT = t }
         } else { hoverSince = nil }
+        if petting {
+            if catPetStart == nil { catPetStart = catTime }
+        } else { catPetStart = nil }
 
         // springy sway
         leanV += -lean * 0.3; leanV *= 0.78; lean = max(-2.5, min(2.5, lean + leanV))
 
         // melts into a sleepy puddle after a quiet spell (sooner late at night)
-        if thinking { lastActive = t }
+        if thinking || processing || asking { wake() }
         if sleepSince == nil && t - lastActive > (night ? 60 : 300) { sleepSince = t }
         switch env["PB_MOOD"] {
-        case "sleepy": if sleepSince == nil { sleepSince = t - 2 }
+        case "sleepy": if !thinking && !processing && !asking && !over && sleepSince == nil { sleepSince = t - 2 }
         case "pet": if t - heartT > 2.6 { heartT = t }
         case "proud": if t - sparkT > 1.6 { proud() }
         case "worried": if t - worryT > 1.5 { worry() }
@@ -904,14 +1204,24 @@ final class Goo: NSView {
     var petting: Bool { if env["PB_MOOD"] == "pet" { return true }; if let h = hoverSince { return t - h > 0.6 } else { return false } }
 
     private func drawCat() {
-        let neutralState = sleeping || thinking || asking || petting || t - worryT < 1.4
-        let blinkFrame = Int((catTime - catBlinkStart) * 12)
-        let image: NSImage
-        if !neutralState && (0..<4).contains(blinkFrame) { image = CatSprites.blink[blinkFrame] }
-        else if neutralState { image = CatSprites.idle[0] }
-        else { image = CatSprites.idle[Int(catTime / 0.45) % 4] }
+        let frame = EdenAnimation.select(catTime: catTime,
+                                         sleepAge: sleepSince.map { max(0, t - $0) },
+                                         thinking: thinking || processing, asking: asking,
+                                         petting: petting, worried: t - worryT < 1.4,
+                                         happyAge: catTime - catHappyStart,
+                                         blinkAge: catTime - catBlinkStart,
+                                         waveAge: catTime - catWaveStart,
+                                         pettingAge: catPetStart.map { catTime - $0 } ?? -1,
+                                         confusedAge: catTime - catConfusedStart)
+        guard let image = CatSprites.image(for: frame) else {
+            let label = "Eden art\nmissing" as NSString
+            label.draw(in: bounds.insetBy(dx: 2, dy: 2), withAttributes: [
+                .font: NSFont.boldSystemFont(ofSize: min(14, catDrawSize * 0.16)),
+                .foregroundColor: NSColor.systemRed])
+            return
+        }
 
-        // Every frame uses the full 288-square canvas, so the paws keep one baseline.
+        // Align the full canvas at the same bottom edge; sleeping art is 288 by 256.
         let hopAge = t - hopT, throwAge = t - throwT
         let hopLift = hopAge >= 0 && hopAge < 0.7 * Double(hops)
             ? 1.5 * sin((hopAge.truncatingRemainder(dividingBy: 0.7) / 0.7) * .pi) : 0
@@ -921,7 +1231,8 @@ final class Goo: NSView {
         let previousInterpolation = context?.imageInterpolation
         context?.imageInterpolation = .none
         image.draw(in: NSRect(x: 2 + offsetX, y: max(hopLift, throwLift).rounded(.down),
-                              width: catDrawSize, height: catDrawSize),
+                              width: catDrawSize,
+                              height: catDrawSize * image.size.height / image.size.width),
                    from: NSRect(origin: .zero, size: image.size), operation: .sourceOver,
                    fraction: 1, respectFlipped: true, hints: nil)
         if let previousInterpolation { context?.imageInterpolation = previousInterpolation }
@@ -929,22 +1240,18 @@ final class Goo: NSView {
         func cell(_ x: Int, _ y: Int, _ color: NSColor) {
             color.setFill(); NSRect(x: CGFloat(x * 2), y: CGFloat(y * 2), width: 2, height: 2).fill()
         }
-        let white = NSColor.white
-        if sleeping {
-            for (x, y) in [(13, 11), (14, 11), (14, 12), (13, 13), (14, 13)] { cell(x, y, white) }
-        } else if asking {
-            for (x, y) in [(12, 12), (13, 13), (14, 12), (14, 11), (13, 10), (13, 8)] { cell(x, y, white) }
-        } else if thinking {
-            for x in 11...13 where x - 11 <= Int(catTime * 2.5) % 3 { cell(x, 12, white) }
+        let overlays = EdenAnimation.overlays(for: frame, asking: asking,
+                                               petting: petting, worried: t - worryT < 1.4)
+        if overlays.contains(.question) {
+            for (x, y) in [(12, 12), (13, 13), (14, 12), (14, 11), (13, 10), (13, 8)] { cell(x, y, .white) }
         }
-        if petting || t - heartT < 1.6 {
+        if overlays.contains(.heart) {
             let pink = rgb(1, 0.42, 0.62)
             for (x, y) in [(12, 11), (14, 11), (12, 10), (13, 10), (14, 10), (13, 9)] { cell(x, y, pink) }
         }
-        if t - sparkT < 1.4 {
-            for (x, y) in [(1, 11), (2, 12), (3, 11), (2, 10)] { cell(x, y, white) }
+        if overlays.contains(.warning) {
+            cell(14, 10, rgb(1, 0.75, 0.4)); cell(14, 8, rgb(1, 0.75, 0.4))
         }
-        if t - worryT < 1.4 { cell(14, 10, rgb(1, 0.75, 0.4)); cell(14, 8, rgb(1, 0.75, 0.4)) }
     }
 
     override func draw(_ r: NSRect) {
@@ -1294,7 +1601,7 @@ final class Wave: NSView {
     }
 }
 
-final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextViewDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
+final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchFieldDelegate, NSTextViewDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
     var provider = ProviderID(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .claude
     var pillProviderMenu: NSMenu?
     private var pillTerminalMenu: NSMenu?
@@ -1315,6 +1622,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     private var codexActivity = ""
     private var codexSendDiagnostic: CodexSendDiagnostic?
     var panel: Panel!
+    var chatPanel: Panel!
     var field: Field!
     var inputScroll: NSScrollView!
     var inputBackground: NSView!
@@ -1332,6 +1640,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     var socialTabs: [String: (win: Int, tab: Int)] = [:]
     var ring: Pill!
     var statusItem: NSStatusItem!         // the little goo in the menu bar, so Mochi is always findable
+    private var petMenu: NSMenu?
     var meter: NSTextField!              // while Claude works: how long, and how many tokens it has written
     var meterText = ""
     var todoBadge: TodoBadge!
@@ -1357,6 +1666,23 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     var sending = false
     private var launcherInProgress = false
     private var guidedMessage = GuidedMessageFlow()
+    private var quickFlow = QuickActionFlow()
+    private var quickCatalog: [InstalledApplication] = []
+    private var quickTargets: [(app: InstalledApplication, pid: pid_t?)] = []
+    private var quickFolders: [DesktopFolder] = []
+    private var quickLoading = false
+    private var quickRows: [NSView] = []
+    private var quickSectionLabel: NSTextField!
+    private var quickBackButton: NSButton!
+    private var quickCancelButton: NSButton!
+    private var quickScroll: NSScrollView!
+    private var quickContent: NSView!
+    private var quickSearch: NSSearchField!
+    private var quickCopyField: NSTextField!
+    private var quickCopyButton: NSButton!
+    private var quickMessageButtons: [NSButton] = []
+    private var quickActionButtons: [NSButton] = []
+    private var quickSavedDraft: String?
     var lastApp: NSRunningApplication?
     var open = false
 
@@ -1372,9 +1698,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     var seenVisitors: Set<String>? = nil
     var lastMidX: CGFloat = 0, lastMoveT = 0.0
 
-    // The collapsed window contains only the pet; the chat grows above it.
+    // The pet keeps its own fixed transparent window; chat is a separate panel.
     let W: CGFloat = 340, H: CGFloat = 168
-    let w: CGFloat = 144, h: CGFloat = 144
+    let w: CGFloat = 96, h: CGFloat = 96
 
     // focus diary: what Mochi did lately, written out whenever it loses focus while the bar is open (to catch focus thieves)
     var recent: [String] = []
@@ -1401,9 +1727,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         let mouse = NSEvent.mouseLocation
         var scr = (NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main!).visibleFrame
         if let i = Int(ProcessInfo.processInfo.environment["PB_SCREEN"] ?? ""), i < NSScreen.screens.count { scr = NSScreen.screens[i].visibleFrame }
-        let initialFrame = PetChatLayout.targetFrame(
-            current: NSRect(x: scr.midX - w/2, y: scr.minY + 18, width: w, height: h),
-            wasOpen: false, willOpen: false, size: NSSize(width: w, height: h), visible: scr)
+        let initialFrame = PetChatLayout.petFrame(
+            NSRect(x: scr.midX - w/2, y: scr.minY + 18, width: w, height: h), visible: scr)
         panel = Panel(contentRect: initialFrame,
                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .floating
@@ -1416,20 +1741,39 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         panel.hasShadow = false
         panel.delegate = self
 
-        // Transparent pet when collapsed; the smoked glass is shown only for chat.
+        // The pet panel never changes size or position when chat opens.
         ring = Pill(frame: NSRect(x: 0, y: 0, width: w, height: h))
         ring.wantsLayer = true; ring.layer?.cornerRadius = 16
         ring.layer?.borderWidth = 0; ring.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
         panel.contentView = ring
 
-        let glass = PillGlass(frame: NSRect(x: 1, y: 1, width: w - 2, height: h - 2))
+        chatPanel = Panel(contentRect: PetChatLayout.chatFrame(pet: initialFrame,
+                           size: NSSize(width: W, height: H), visible: scr),
+                          styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        chatPanel.level = .floating
+        chatPanel.isFloatingPanel = true
+        chatPanel.hidesOnDeactivate = false
+        chatPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        chatPanel.isMovableByWindowBackground = false
+        chatPanel.backgroundColor = .clear
+        chatPanel.isOpaque = false
+        chatPanel.hasShadow = true
+        chatPanel.delegate = self
+        let chatRing = Pill(frame: NSRect(x: 0, y: 0, width: W, height: H))
+        chatRing.autoresizingMask = [.width, .height]
+        chatRing.wantsLayer = true
+        chatRing.layer?.borderWidth = 1
+        chatRing.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
+        chatPanel.contentView = chatRing
+
+        let glass = PillGlass(frame: NSRect(x: 1, y: 1, width: W - 2, height: H - 2))
         chatGlass = glass
         glass.autoresizingMask = [.width, .height]
         glass.appearance = NSAppearance(named: .darkAqua)
         glass.material = .hudWindow; glass.blendingMode = .behindWindow; glass.state = .active
         glass.wantsLayer = true; glass.layer?.cornerRadius = 15; glass.layer?.masksToBounds = true
         glass.layer?.borderWidth = 1; glass.layer?.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
-        ring.addSubview(glass)
+        chatRing.addSubview(glass)
 
         // tint so the pill stays dark whatever is behind it
         let tint = NSView(frame: glass.bounds)
@@ -1440,7 +1784,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         petHandle = PetHandle(frame: NSRect(x: 0, y: 0, width: w, height: h))
         petHandle.onClick = { [weak self] in self?.catClicked() }
         ring.addSubview(petHandle)
-        dot = Goo(frame: NSRect(x: 0, y: 0, width: 132, height: 128))
+        dot = Goo(frame: NSRect(x: 0, y: 0, width: 84, height: 80))
         ring.addSubview(dot)
         let d = UserDefaults.standard, today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
         dot.fed = d.double(forKey: "fedDay") == today ? d.integer(forKey: "fed") : 0
@@ -1506,28 +1850,66 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         status.cell?.lineBreakMode = .byTruncatingMiddle
         glass.addSubview(status)
 
+        quickSectionLabel = NSTextField(labelWithString: "Quick Actions")
+        quickSectionLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        quickSectionLabel.textColor = NSColor(white: 1, alpha: 0.78)
+        glass.addSubview(quickSectionLabel)
+        quickBackButton = NSButton(title: "Back", target: self, action: #selector(quickBack))
+        quickCancelButton = NSButton(title: "Cancel", target: self, action: #selector(quickCancel))
+        for button in [quickBackButton!, quickCancelButton!] {
+            button.bezelStyle = .rounded
+            button.font = .systemFont(ofSize: 11)
+            glass.addSubview(button)
+        }
+        quickScroll = NSScrollView(frame: .zero)
+        quickScroll.drawsBackground = false
+        quickScroll.hasVerticalScroller = true
+        quickScroll.autohidesScrollers = true
+        quickScroll.borderType = .noBorder
+        quickContent = NSView(frame: NSRect(x: 0, y: 0, width: W - 32, height: 120))
+        quickScroll.documentView = quickContent
+        glass.addSubview(quickScroll)
+        quickSearch = NSSearchField(frame: .zero)
+        quickSearch.placeholderString = "Search installed apps"
+        quickSearch.delegate = self
+        quickCopyField = NSTextField(frame: .zero)
+        quickCopyField.placeholderString = "Text to copy"
+        quickCopyField.target = self
+        quickCopyField.action = #selector(copyQuickText)
+        quickCopyButton = NSButton(title: "Copy to Clipboard", target: self, action: #selector(copyQuickText))
+        quickCopyButton.bezelStyle = .rounded
+        for action in QuickActionFlow.Action.allCases {
+            let button = NSButton(title: action.title, target: self, action: #selector(chooseQuickAction(_:)))
+            button.tag = action.rawValue
+            button.image = NSImage(systemSymbolName: action.symbol, accessibilityDescription: action.title)
+            button.imagePosition = .imageLeft
+            button.bezelStyle = .rounded
+            quickActionButtons.append(button)
+        }
+        for (index, name) in ["ChatGPT", "Claude"].enumerated() {
+            let button = NSButton(title: name, target: self, action: #selector(chooseQuickMessage(_:)))
+            button.tag = index
+            button.image = NSImage(systemSymbolName: "bubble.left", accessibilityDescription: name)
+            button.imagePosition = .imageLeft
+            button.bezelStyle = .rounded
+            quickMessageButtons.append(button)
+        }
+        renderQuickActions()
+
         // on top of everything: the paper plane
         fx = Fx(frame: glass.bounds); fx.autoresizingMask = [.width, .height]
         glass.addSubview(fx)
 
-        let menu = NSMenu()
-        let browse = NSMenuItem(title: "Browse Codex Threads…", action: #selector(browseCodexThreads), keyEquivalent: "")
-        browse.target = self; menu.addItem(browse)
-        let advanced = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
-        advanced.submenu = makeAdvancedMenu(pill: true); menu.addItem(advanced)
-        menu.addItem(.separator())
-        let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
-        login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login); menu.addItem(.separator())
-        let paint = NSMenuItem(title: "Change Original Pet Color…", action: #selector(pickColor(_:)), keyEquivalent: "")
-        paint.target = self; menu.addItem(paint); menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit Eden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         // open at login: switched on once, the first time; after that the menu item decides
         if !UserDefaults.standard.bool(forKey: "loginSet") {
             UserDefaults.standard.set(true, forKey: "loginSet")
-            do { try SMAppService.mainApp.register(); login.state = .on } catch { NSLog("login item: \(error)") }
+            do { try SMAppService.mainApp.register() } catch { NSLog("login item: \(error)") }
         }
-        ring.menu = menu; glass.menu = menu; petHandle.menu = menu
+        let menu = NSMenu()
+        petMenu = menu
+        menu.delegate = self
+        populateMenu(menu, pet: true)
+        ring.menu = menu; chatRing.menu = menu; glass.menu = menu; petHandle.menu = menu
         social.menu = menu; todoBadge.menu = menu
 
         lay()
@@ -1535,6 +1917,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         makeStatusItem()
 
         makeBubble()
+        reportPetArtwork()
         lastSeen = modified()   // don't pop up an old reply at launch
         if let d = try? Data(contentsOf: progressFile), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { progressSeen = j["text"] as? String ?? "" }
         if let d = try? Data(contentsOf: questionFile), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let id = j["id"] as? String, Date().timeIntervalSince1970 - (j["time"] as? Double ?? 0) > 1800 { qShownId = id }   // a stale question
@@ -1558,9 +1941,36 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
 
     // MARK: the menu bar pet
 
+    func reportPetArtwork() {
+        if dot.useCat {
+            let issues = CatSprites.loadIssues
+            NSLog("Eden pet renderer: Eden; unavailable sprite frames: %d", issues.count)
+            if !issues.isEmpty {
+                NSLog("Eden unavailable sprite frames: %@", issues.joined(separator: "; "))
+                showBubble(CatSprites.neutral == nil
+                    ? "Eden cat artwork is unavailable: \(issues.joined(separator: "; ")). Rebuild Eden with its sprite assets."
+                    : "Some Eden cat frames are unavailable: \(issues.joined(separator: "; ")). Using Eden artwork where possible.",
+                    project: "Eden", react: false)
+            }
+        } else {
+            NSLog("Eden pet renderer: original Mochi (explicit PB_PET_ART override)")
+        }
+        let others = Bundle.main.bundleIdentifier.map { bundleID in
+            NSWorkspace.shared.runningApplications.filter {
+                $0.bundleIdentifier == bundleID &&
+                    $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            }
+        } ?? []
+        NSLog("Eden other processes with this bundle identifier: %d", others.count)
+        if !others.isEmpty && CatSprites.neutral != nil {
+            showBubble("Another app with Eden's bundle identifier is running. Check older app copies if you see the wrong pet.",
+                       project: "Eden", react: false)
+        }
+    }
+
     func makeStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if ProcessInfo.processInfo.environment["PB_PET_ART"] != "mochi", let cat = CatSprites.idle.first {
+        if dot.useCat, let cat = CatSprites.neutral {
             let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
                 NSGraphicsContext.current?.imageInterpolation = .none
                 cat.draw(in: rect, from: NSRect(origin: .zero, size: cat.size),
@@ -1569,7 +1979,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             }
             img.isTemplate = false
             statusItem.button?.image = img
-        } else {
+        } else if !dot.useCat {
             let shape = ["..XXXXX..", ".XXXXXXX.", "XXXXXXXXX", "XX.XXX.XX", "XX.XXX.XX", "XXXXXXXXX", "XXXXXXXXX", "XXXXXXXXXXX"]
             let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
                 NSColor.black.setFill()
@@ -1580,28 +1990,45 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             }
             img.isTemplate = true
             statusItem.button?.image = img
+        } else {
+            statusItem.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
+                                               accessibilityDescription: "Eden cat artwork missing")
         }
-        statusItem.button?.toolTip = "Eden"
+        statusItem.button?.toolTip = dot.useCat && CatSprites.neutral == nil ? "Eden cat artwork missing" : "Eden"
         let m = NSMenu(); m.delegate = self; statusItem.menu = m
     }
 
-    // the menu is rebuilt each time it opens, so the to-do count and Show/Hide are current
+    // Both menus refresh their count, visibility label and checkmarks when opened.
     func menuNeedsUpdate(_ m: NSMenu) {
-        guard m === statusItem?.menu else { return }
+        guard m === statusItem?.menu || m === petMenu else { return }
+        populateMenu(m, pet: m === petMenu)
+    }
+
+    private func populateMenu(_ m: NSMenu, pet: Bool) {
         m.removeAllItems()
         func item(_ t: String, _ a: Selector) { let i = NSMenuItem(title: t, action: a, keyEquivalent: ""); i.target = self; m.addItem(i) }
-        item("Find Eden", #selector(findMochi))
-        item("Ask Eden…", #selector(messageMochi))
+        item("Chat with Eden", #selector(messageMochi))
         let n = todos.filter { $0.done == nil }.count
-        item(n > 0 ? "To-do list (\(n))" : "To-do list", #selector(openTodoFromMenu))
-        item(panel.isVisible ? "Hide Eden" : "Show Eden", #selector(toggleShown))
+        item(n > 0 ? "To-do List (\(n))" : "To-do List", #selector(openTodoFromMenu))
+        item("Find Eden", #selector(findMochi))
         m.addItem(.separator())
-        item("Browse Codex Threads…", #selector(browseCodexThreads))
+        let preferences = NSMenuItem(title: "Preferences", action: nil, keyEquivalent: "")
+        preferences.submenu = makePreferencesMenu(); m.addItem(preferences)
         let advanced = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
-        advanced.submenu = makeAdvancedMenu(); m.addItem(advanced)
+        advanced.submenu = makeAdvancedMenu(pill: pet); m.addItem(advanced)
+        m.addItem(.separator())
+        item(panel.isVisible ? "Hide Eden" : "Show Eden", #selector(toggleShown))
+        let quit = NSMenuItem(title: "Quit Eden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp; m.addItem(quit)
+    }
+
+    private func makePreferencesMenu() -> NSMenu {
+        let m = NSMenu()
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
-        login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off; m.addItem(login)
-        m.addItem(withTitle: "Quit Eden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        login.target = self
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        m.addItem(login)
+        return m
     }
 
     func makeProviderMenu() -> NSMenu {
@@ -1616,6 +2043,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
 
     private func makeAdvancedMenu(pill: Bool = false) -> NSMenu {
         let menu = NSMenu()
+        let browse = NSMenuItem(title: "Browse Codex Threads…", action: #selector(browseCodexThreads), keyEquivalent: "")
+        browse.target = self; menu.addItem(browse)
+        menu.addItem(.separator())
         let providerItem = NSMenuItem(title: "Provider", action: nil, keyEquivalent: "")
         providerItem.submenu = makeProviderMenu()
         if pill { pillProviderMenu = providerItem.submenu }
@@ -1627,6 +2057,12 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         let sendItem = NSMenuItem(title: "Send Draft to Selected CLI in Terminal…",
                                   action: #selector(sendAdvancedMessage), keyEquivalent: "")
         sendItem.target = self; menu.addItem(sendItem)
+        menu.addItem(.separator())
+        let diagnostics = NSMenuItem(title: "Codex Send Diagnostics…",
+                                     action: #selector(showCodexSendDiagnostics), keyEquivalent: "")
+        diagnostics.target = self; menu.addItem(diagnostics)
+        let paint = NSMenuItem(title: "Change Original Pet Color…", action: #selector(pickColor(_:)), keyEquivalent: "")
+        paint.target = self; menu.addItem(paint)
         return menu
     }
 
@@ -1698,7 +2134,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         pillProviderMenu?.items.forEach { $0.state = ($0.representedObject as? String) == next.rawValue ? .on : .off }
         pillTerminalMenu?.items.forEach { $0.state = ($0.representedObject as? String) == next.rawValue ? .on : .off }
         answeringOther = false; resetPlaceholder()
-        dot.thinking = false; dot.asking = false
+        dot.thinking = false; dot.processing = false; dot.asking = false
         meterText = ""; meter.stringValue = ""
         nowText = ""; showStep("")
         qData = nil; hideQuestion(); hideBubble()
@@ -1713,7 +2149,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         updateDestinationDisplay()
         if wasActive { flash("Codex turn may continue; follow it in Codex", false) }
-        if !open { fitCollapsed() }; lay()
+        lay()
     }
 
     private func destinationLabel() -> String {
@@ -1725,7 +2161,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         status.textColor = NSColor(white: 1, alpha: 0.6)
         status.toolTip = "Ask for a desktop action. Terminal sending is in Advanced."
         resetPlaceholder()
-        if !open { fitCollapsed() }; lay()
+        lay()
     }
 
     private func clearCodexDestination() {
@@ -1737,7 +2173,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         discoveredThreads = []; codexRoute = .terminal
         codexStarting = false; codexAwaitingTurnAck = false; codexTurnID = nil
         codexQueuedEvents = []; codexQueuedRequests = []; codexFinalText = ""; codexFileChangePreviews = [:]
-        codexActivity = ""; sending = false; dot.thinking = false
+        codexActivity = ""; sending = false; dot.processing = false; dot.thinking = false
     }
 
     // A separate, consented history surface. It never changes the Terminal destination.
@@ -1776,8 +2212,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         client.onDisconnect = { [weak self, weak client] reason in
             guard let self, let client, self.historyClient === client else { return }
-            self.codexDisconnected(reason)
+            if self.codexRoute == .desktop { self.codexDisconnected(reason) }
+            else { self.historyError("Codex App Server disconnected: \(reason.localizedDescription)") }
         }
+        dot.processing = true
         flash("reading Codex threads…", false)
         client.connect { [weak self, weak client] result in
             guard let self, let client, self.historyClient === client else { return }
@@ -1829,6 +2267,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
 
     private func showCodexThreadPicker(_ client: CodexHistoryClient) {
         guard historyClient === client else { return }
+        dot.processing = false
         guard !discoveredThreads.isEmpty else {
             historyError("No local Codex threads were returned for this account, host and source filter."); return
         }
@@ -1866,6 +2305,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     }
 
     private func readCodexThread(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread) {
+        dot.processing = true
         client.request("thread/read", ["threadId": thread.id]) { [weak self, weak client] result in
             guard let self, let client, self.historyClient === client else { return }
             switch result {
@@ -1893,6 +2333,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
 
     private func showCodexTranscript(_ client: CodexHistoryClient, _ thread: CodexHistoryClient.Thread,
                                      turns: [[String: Any]], note: String? = nil) {
+        dot.processing = false
         var lines: [String] = []
         for turn in turns.reversed() {
             guard let items = turn["items"] as? [[String: Any]] else { continue }
@@ -1928,6 +2369,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     }
 
     private func historyError(_ message: String, closeConnection: Bool = true) {
+        dot.processing = false
         if closeConnection { historyClient?.stop(); historyClient = nil; discoveredThreads = [] }
         showBubble("I couldn't load Codex conversations. Your draft is still here.",
                    project: "Eden", react: false)
@@ -1945,7 +2387,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         let scr = (NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main!).visibleFrame
         let f = panel.frame
         panel.setFrame(NSRect(x: scr.midX - f.width/2, y: scr.minY + 18, width: f.width, height: f.height), display: true)
-        panel.orderFrontRegardless(); repositionPanels()
+        panel.orderFrontRegardless(); positionChat(); repositionPanels()
         dot.greet()
     }
     @objc func messageMochi() { if !panel.isVisible { findMochi() }; setOpen(true) }
@@ -1981,7 +2423,6 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             showBubble("\(m["name"] as? String ?? "Someone") just arrived on \(place(m))", project: "", react: false)
         }
         seenVisitors = ids
-        if !open { fitCollapsed() }
         lay()
     }
 
@@ -2033,7 +2474,6 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             if !ups.isEmpty { showBubble(ups.joined(separator: " · "), project: "notifications", react: false); dot.hop() }
         }
         socialSeen = best
-        if !open { fitCollapsed() }
         lay()
     }
 
@@ -2058,25 +2498,35 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
     }
 
-    var collapsedWidth: CGFloat { w }
-
-    func fitCollapsed() {
-        guard !open else { return }
-        let W2 = collapsedWidth, f = panel.frame
-        if abs(f.width - W2) > 0.5 { panel.setFrame(NSRect(x: f.midX - W2/2, y: f.minY, width: W2, height: h), display: true) }
+    private var hasChatBadges: Bool {
+        !visitors.tints.isEmpty || !social.counts.isEmpty || todoBadge.n > 0 || !meterText.isEmpty
     }
 
-    // The pet stays at the lower left while chat grows above it.
+    private var desiredQuickChatHeight: CGFloat {
+        QuickChatLayout.height(for: quickFlow.state, hasBadges: hasChatBadges)
+    }
+
+    func positionChat() {
+        guard open else { return }
+        let centre = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        let screen = NSScreen.screens.first { NSMouseInRect(centre, $0.frame, false) } ?? panel.screen
+        let height = min(desiredQuickChatHeight, max(168, (screen?.visibleFrame.height ?? desiredQuickChatHeight) - 16))
+        let frame = PetChatLayout.chatFrame(pet: panel.frame,
+                                             size: NSSize(width: W, height: height), visible: screen?.visibleFrame)
+        if chatPanel.frame != frame { chatPanel.setFrame(frame, display: true) }
+    }
+
+    // The pet's sprite and transparent hit area stay fixed while chat is shown separately.
     func lay() {
-        dot.catDrawSize = open ? 28 : 128
-        dot.frame = NSRect(x: open ? 12 : 6, y: open ? 12 : 8,
-                           width: open ? 32 : 132, height: open ? 28 : 128)
+        dot.catDrawSize = 80
+        dot.frame = NSRect(x: 6, y: 10, width: 84, height: 80)
         dot.needsDisplay = true
-        petHandle.frame = NSRect(x: open ? 8 : 0, y: open ? 8 : 0,
-                                 width: open ? 44 : w, height: open ? 40 : h)
+        petHandle.frame = NSRect(x: 0, y: 0, width: w, height: h)
         chatGlass.isHidden = !open
         mini.isHidden = true
         guard open else { return }
+        positionChat()
+        let H = chatPanel.frame.height
         chatTitle.frame = NSRect(x: 16, y: H - 31, width: 245, height: 20)
         closeChatButton.frame = NSRect(x: W - 36, y: H - 37, width: 28, height: 28)
         var x: CGFloat = 16
@@ -2092,16 +2542,24 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         meter.sizeToFit()
         meter.frame.origin = NSPoint(x: min(x, W - meter.frame.width - 12), y: H - 58)
         meter.isHidden = meterText.isEmpty
-        inputBackground.frame = NSRect(x: 12, y: 42, width: W - 24, height: 67)
-        inputScroll.frame = NSRect(x: 19, y: 48, width: W - 38, height: 55)
-        status.frame = NSRect(x: 54, y: 17, width: W - 68, height: 15)
+        inputBackground.frame = QuickChatLayout.input
+        inputScroll.frame = QuickChatLayout.inputText
+        status.frame = NSRect(x: 16, y: 1, width: W - 32, height: 14)
         inputScroll.isHidden = false
-        status.isHidden = false
+        status.isHidden = status.stringValue == destinationLabel()
+        let headingY = QuickChatLayout.headingY(height: H, hasBadges: hasChatBadges)
+        quickSectionLabel.frame = NSRect(x: 16, y: headingY, width: 200, height: 17)
+        quickBackButton.frame = NSRect(x: W - 151, y: headingY - 3, width: 62, height: 22)
+        quickCancelButton.frame = NSRect(x: W - 84, y: headingY - 3, width: 69, height: 22)
+        quickBackButton.isHidden = quickFlow.state == .home
+        quickCancelButton.isHidden = quickFlow.state == .home
+        quickScroll.frame = QuickChatLayout.scrollFrame(height: H, hasBadges: hasChatBadges)
     }
 
     private func catClicked() {
         if open { setOpen(false); return }
         if todoPanel?.isVisible == true && (todoPanel?.alphaValue ?? 0) > 0.5 { hideTodoList(); return }
+        dot.wave()
         setOpen(true)
     }
 
@@ -2113,34 +2571,222 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
 
     @objc private func collapseChat() { setOpen(false) }
 
-    // grow or shrink around the bar's current bottom centre
+    private func refreshQuickActions() {
+        if open { lay() }
+        renderQuickActions()
+        chatPanel.recalculateKeyViewLoop()
+    }
+
+    private func renderQuickActions() {
+        quickContent.subviews.forEach { $0.removeFromSuperview() }
+        quickRows = []
+        switch quickFlow.state {
+        case .home:
+            quickSectionLabel.stringValue = "Quick Actions"
+            quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: 100)
+            for (index, button) in quickActionButtons.enumerated() {
+                let col = index % 3, row = index / 3
+                button.frame = NSRect(x: CGFloat(col) * 102,
+                                      y: CGFloat(1 - row) * (QuickChatLayout.buttonSize.height + QuickChatLayout.buttonRowGap),
+                                      width: QuickChatLayout.buttonSize.width, height: QuickChatLayout.buttonSize.height)
+                quickContent.addSubview(button)
+            }
+            quickContent.scroll(NSPoint(x: 0, y: 0))
+        case .selecting(let action):
+            quickSectionLabel.stringValue = action.title
+            switch action {
+            case .copy:
+                quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: 84)
+                quickCopyField.frame = NSRect(x: 0, y: 49, width: W - 44, height: 26)
+                quickCopyButton.frame = NSRect(x: 0, y: 7, width: 154, height: 30)
+                quickContent.addSubview(quickCopyField)
+                quickContent.addSubview(quickCopyButton)
+            case .message:
+                quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: 86)
+                for (index, button) in quickMessageButtons.enumerated() {
+                    button.frame = NSRect(x: CGFloat(index) * 154, y: 32, width: 146, height: 38)
+                    quickContent.addSubview(button)
+                }
+            case .open, .switchTo, .hide, .quit:
+                quickSearch.placeholderString = action == .open ? "Search installed apps or folders" : "Search running apps"
+                quickContent.addSubview(quickSearch)
+                renderQuickList()
+            }
+        }
+    }
+
+    private func renderQuickList() {
+        guard case .selecting(let action) = quickFlow.state, action.appAction != nil else { return }
+        quickRows.forEach { $0.removeFromSuperview() }
+        quickRows = []
+        let search = LauncherAppResolver.normalized(quickSearch.stringValue)
+        let matches: (String) -> Bool = { search.isEmpty || LauncherAppResolver.normalized($0).contains(search) }
+        quickFolders = action == .open ? DesktopFolder.allQuickCases.filter { matches($0.title) } : []
+        let candidates: [(app: InstalledApplication, pid: pid_t?)]
+        if action == .open {
+            candidates = quickCatalog.map { ($0, nil) }
+        } else {
+            candidates = NSWorkspace.shared.runningApplications.compactMap { running in
+                guard !running.isTerminated, running.activationPolicy == .regular,
+                      running.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                      let url = running.bundleURL, let app = InstalledApplication(url: url) else { return nil }
+                return (app, running.processIdentifier)
+            }
+        }
+        let filtered = candidates.filter { matches($0.app.displayName) || matches($0.app.bundleID) }
+            .sorted { $0.app.displayName.localizedStandardCompare($1.app.displayName) == .orderedAscending }
+        quickTargets = Array(filtered.prefix(100))
+        let count = quickFolders.count + quickTargets.count
+        let contentHeight = max(quickScroll.contentSize.height, CGFloat(count) * 34 + (filtered.count > 100 ? 70 : 44))
+        quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: contentHeight)
+        quickSearch.frame = NSRect(x: 0, y: contentHeight - 30, width: W - 48, height: 26)
+        if count == 0 {
+            let label = NSTextField(labelWithString: quickLoading ? "Finding apps…" : "No matching apps or folders")
+            label.textColor = NSColor(white: 1, alpha: 0.7)
+            label.frame = NSRect(x: 4, y: contentHeight - 67, width: W - 48, height: 20)
+            quickContent.addSubview(label); quickRows.append(label)
+        }
+        for (index, folder) in quickFolders.enumerated() {
+            let button = NSButton(title: folder.title, target: self, action: #selector(chooseQuickFolder(_:)))
+            button.tag = index
+            button.image = NSImage(systemSymbolName: "folder", accessibilityDescription: folder.title)
+            styleQuickRow(button, y: contentHeight - 68 - CGFloat(index) * 34)
+        }
+        for (index, target) in quickTargets.enumerated() {
+            let duplicate = quickTargets.contains {
+                $0.app.url != target.app.url && $0.app.displayName == target.app.displayName
+            }
+            let location = duplicate ? " · \(target.app.url.deletingLastPathComponent().path)" : ""
+            let suffix = location + (target.pid.map { " · PID \($0)" } ?? "")
+            let button = NSButton(title: target.app.displayName + suffix, target: self, action: #selector(chooseQuickApp(_:)))
+            button.tag = index
+            button.image = NSWorkspace.shared.icon(forFile: target.app.url.path)
+            button.toolTip = "\(target.app.bundleID)\n\(target.app.url.path)"
+            styleQuickRow(button, y: contentHeight - 68 - CGFloat(quickFolders.count + index) * 34)
+        }
+        if filtered.count > 100 {
+            let label = NSTextField(labelWithString: "Showing 100 apps. Search to narrow the list.")
+            label.textColor = NSColor(white: 1, alpha: 0.7)
+            label.frame = NSRect(x: 4, y: 5, width: W - 48, height: 20)
+            quickContent.addSubview(label); quickRows.append(label)
+        }
+        quickContent.scroll(NSPoint(x: 0, y: max(0, contentHeight - quickScroll.contentSize.height)))
+        chatPanel.recalculateKeyViewLoop()
+    }
+
+    private func styleQuickRow(_ button: NSButton, y: CGFloat) {
+        button.frame = NSRect(x: 0, y: y, width: W - 48, height: 30)
+        button.bezelStyle = .rounded
+        button.imagePosition = .imageLeft
+        button.alignment = .left
+        button.lineBreakMode = .byTruncatingMiddle
+        quickContent.addSubview(button)
+        quickRows.append(button)
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        if notification.object as? NSSearchField === quickSearch { renderQuickList() }
+    }
+
+    @objc private func chooseQuickAction(_ sender: NSButton) {
+        guard let action = QuickActionFlow.Action(rawValue: sender.tag), !guidedMessage.isActive,
+              !sending, !launcherInProgress else {
+            showBubble("Finish your current message or action first.", project: "Eden", react: false)
+            return
+        }
+        quickFlow.begin(action)
+        quickSearch.stringValue = ""
+        if action == .open { quickCatalog = [] }
+        quickLoading = action == .open
+        refreshQuickActions()
+        if action == .open {
+            LauncherAppDiscovery.discover(names: []) { [weak self] catalog in
+                guard let self, self.quickFlow.state == .selecting(.open) else { return }
+                self.quickCatalog = catalog
+                self.quickLoading = false
+                self.renderQuickList()
+            }
+        }
+        if action == .copy { chatPanel.makeFirstResponder(quickCopyField) }
+        else if action.appAction != nil { chatPanel.makeFirstResponder(quickSearch) }
+    }
+
+    @objc private func quickBack() {
+        guard !sending else { showBubble("Wait for this action to finish.", project: "Eden", react: false); return }
+        quickFlow.back()
+        refreshQuickActions()
+        chatPanel.makeFirstResponder(field)
+    }
+
+    @objc private func quickCancel() {
+        guard !sending else { showBubble("Wait for this action to finish.", project: "Eden", react: false); return }
+        quickFlow.cancel()
+        refreshQuickActions()
+        chatPanel.makeFirstResponder(field)
+        showBubble("Okay, cancelled. Your draft is still here.", project: "Eden", react: false)
+    }
+
+    @objc private func chooseQuickFolder(_ sender: NSButton) {
+        guard quickFolders.indices.contains(sender.tag) else { return }
+        let folder = quickFolders[sender.tag]
+        let draft = field.stringValue
+        openDesktopFolder(folder, draft: draft, preserveDraft: true)
+        quickFlow.back(); refreshQuickActions()
+    }
+
+    @objc private func chooseQuickApp(_ sender: NSButton) {
+        guard quickTargets.indices.contains(sender.tag), case .selecting(let action) = quickFlow.state,
+              let appAction = action.appAction, !sending else { return }
+        let target = quickTargets[sender.tag]
+        sending = true; dot.processing = true
+        performAppAction(appAction, on: target.app, preferredPID: target.pid) { [weak self] success, message in
+            guard let self else { return }
+            self.sending = false; self.dot.processing = false
+            if success { self.dot.happy(); self.quickFlow.back(); self.refreshQuickActions() }
+            else { self.dot.worry(); self.renderQuickList() }
+            self.showBubble(message + (success ? "." : ". Your draft is still here."), project: "Eden", react: false)
+        }
+    }
+
+    @objc private func copyQuickText() {
+        let text = quickCopyField.stringValue
+        guard !text.isEmpty else {
+            showBubble("Type something to copy first.", project: "Eden", react: false)
+            return
+        }
+        copyDesktopText(text, draft: field.stringValue, preserveDraft: true)
+        quickFlow.back(); refreshQuickActions()
+    }
+
+    @objc private func chooseQuickMessage(_ sender: NSButton) {
+        guard case .selecting(.message) = quickFlow.state, (0...1).contains(sender.tag) else { return }
+        let destination: GuidedMessageDestination = sender.tag == 0 ? .chatGPT : .claude
+        quickFlow.back(); refreshQuickActions()
+        startGuidedMessage(destination, preserveTypedDraft: true)
+        chatPanel.makeFirstResponder(field)
+    }
+
+    // Show chat beside the fixed pet window; never resize or move the pet for a toggle.
     func setOpen(_ o: Bool) {
         note("setOpen \(o)")
         guard o != open else { return }
-        let wasOpen = open
         open = o
-        let f = panel.frame
-        let size = o ? NSSize(width: W, height: H) : NSSize(width: collapsedWidth, height: h)
-        let to = PetChatLayout.targetFrame(current: f, wasOpen: wasOpen, willOpen: o, size: size,
-                                           visible: panel.screen?.visibleFrame)
-        panel.hasShadow = o
-        ring.layer?.borderWidth = o ? 1 : 0
-        if !o { inputScroll.isHidden = true; status.isHidden = true; chatGlass.isHidden = true }
-        else { chatGlass.isHidden = false }
-        NSAnimationContext.runAnimationGroup({ c in
-            c.duration = 0.22; c.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            panel.animator().setFrame(to, display: true)
-        }, completionHandler: { [weak self] in self?.lay() })
         if o {
+            positionChat()
             lay()
             NSApp.activate(ignoringOtherApps: true)   // otherwise typing keeps going to whatever app was in front (Terminal, after a send)
-            panel.makeKeyAndOrderFront(nil)
-            panel.makeFirstResponder(field)
+            chatPanel.makeKeyAndOrderFront(nil)
+            chatPanel.makeFirstResponder(field)
+        } else {
+            lay()
+            chatPanel.orderOut(nil)
         }
     }
 
     // click away with nothing typed: fold back up
     func windowDidResignKey(_ n: Notification) {
+        guard n.object as? NSWindow === chatPanel else { return }
+        if NSMouseInRect(NSEvent.mouseLocation, panel.frame, false) { return }
         if open && !field.stringValue.isEmpty { diary("bar resigned key") }
         if field.stringValue.isEmpty && !sending { setOpen(false) }
     }
@@ -2218,7 +2864,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             mt = String(format: "%d:%02d", secs / 60, secs % 60)
             if let tk = prog["tokens"] as? Int, tk > 0 { mt += " · " + (tk >= 1000 ? String(format: "%.1fk", Double(tk) / 1000) : "\(tk)") }
         }
-        if mt != meterText { meterText = mt; meter.stringValue = mt; if !open { fitCollapsed() }; lay() }
+        if mt != meterText { meterText = mt; meter.stringValue = mt; lay() }
         // the step Claude is on
         var step = ""
         if dot.thinking, let w = wm, let d = try? Data(contentsOf: doingFile), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -2373,6 +3019,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
 
     // the bubble follows the bar when it's dragged or resized
     func windowDidMove(_ n: Notification) {
+        guard n.object as? NSWindow === panel else { return }
+        positionChat()
         repositionPanels()
         // flung: the goo stretches behind and jiggles
         let now = CACurrentMediaTime(), mx = panel.frame.midX, dt = now - lastMoveT
@@ -2382,7 +3030,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         lastMidX = mx; lastMoveT = now
     }
-    func windowDidResize(_ n: Notification) { repositionPanels() }
+    func windowDidResize(_ n: Notification) {
+        guard n.object as? NSWindow === panel else { return }
+        positionChat()
+        repositionPanels()
+    }
     func repositionPanels() {
         if let n = nowPanel, n.isVisible { placeAbove(n, n.frame.size) }
         if let q = qPanel, q.isVisible { placeAbove(q, q.frame.size) }
@@ -2400,7 +3052,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         if sel == #selector(NSResponder.cancelOperation(_:)) {
             if guidedMessage.isActive { cancelGuidedMessage() }
-            setOpen(false); panel.resignKey(); lastApp?.activate(); return true
+            setOpen(false); chatPanel.resignKey(); lastApp?.activate(); return true
         }
         return false
     }
@@ -2411,11 +3063,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     func flash(_ s: String, _ ok: Bool = true) {
         let c = ok ? NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9) : NSColor(red: 1, green: 0.55, blue: 0.55, alpha: 0.95)
         status.stringValue = s; status.textColor = c
-        mini.stringValue = s; mini.textColor = c; mini.sizeToFit(); fitCollapsed(); lay(); mini.needsDisplay = true
+        mini.stringValue = s; mini.textColor = c; mini.sizeToFit(); lay(); mini.needsDisplay = true
         if !open, bubble != nil { showBubble(s, project: "Eden", react: false) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             self.status.stringValue = self.destinationLabel(); self.status.textColor = NSColor(white: 1, alpha: 0.6)
-            self.mini.stringValue = "Eden"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.fitCollapsed(); self.lay()
+            self.mini.stringValue = "Eden"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.lay()
         }
     }
 
@@ -2556,7 +3208,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             diagnostic.listStatusAtSelection = safeCodexStatus(thread.status)
             codexSendDiagnostic = diagnostic
         }
-        codexStarting = true; sending = true; codexActivity = "checking Codex…"
+        codexStarting = true; sending = true; dot.processing = true; codexActivity = "checking Codex…"
         codexQueuedEvents = []; codexQueuedRequests = []; codexFinalText = ""; codexFileChangePreviews = [:]
         updateDestinationDisplay()
         markCodexDiagnostic(stage: "account before resume", method: "account/read",
@@ -2646,7 +3298,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
                                          summary: "App Server accepted this turn", delivery: "acknowledged")
                 self.codexTurnID = id; self.codexStarting = false; self.codexAwaitingTurnAck = false
                 self.codexActivity = "Codex working…"
-                self.dot.thinking = true
+                self.dot.processing = false; self.dot.thinking = true
                 // A new draft typed while App Server was responding belongs to the next turn.
                 if self.field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == text {
                     self.field.stringValue = ""
@@ -2675,7 +3327,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         codexStarting = false; codexAwaitingTurnAck = false; sending = false
         codexQueuedEvents = []; codexQueuedRequests = []; codexFileChangePreviews = [:]
-        codexActivity = "Codex failed"; dot.thinking = false; dot.worry(); updateDestinationDisplay()
+        codexActivity = "Codex failed"; dot.processing = false; dot.thinking = false; dot.worry(); updateDestinationDisplay()
         flash(message, false) // Draft remains in the field.
     }
 
@@ -2776,8 +3428,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     private func finishCodexTurn(status: String, error: String?, thread: CodexHistoryClient.Thread) {
         guard provider == .codex, codexRoute == .desktop,
               selectedCodexThread?.id == thread.id, codexTurnID != nil else { return }
-        codexTurnID = nil; sending = false; dot.thinking = false
+        codexTurnID = nil; sending = false; dot.processing = false; dot.thinking = false
         if status == "completed" {
+            dot.happy()
             markCodexDiagnostic(stage: "turn completed", method: "turn/completed",
                                 summary: "App Server reported completed", delivery: "completed")
             codexActivity = "Codex completed"
@@ -2801,7 +3454,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         codexTransportFailed(reason)
         historyClient = nil; codexStarting = false; codexAwaitingTurnAck = false; codexTurnID = nil
         codexQueuedEvents = []; codexQueuedRequests = []; codexFileChangePreviews = [:]; sending = false
-        dot.thinking = false; dot.worry()
+        dot.processing = false; dot.thinking = false; dot.worry()
         codexActivity = "Codex disconnected"
         updateDestinationDisplay()
         flash("Codex disconnected; check Codex before retrying", false)
@@ -2907,13 +3560,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending, !launcherInProgress else { return }
         if let destination = GuidedMessageIntentParser().parse(text) {
-            let previousDraft = guidedMessage.draft
-            guidedMessage.start(destination)
-            field.stringValue = previousDraft ?? ""
-            resetPlaceholder("Your message for \(destination.name)…")
-            showBubble(previousDraft == nil ? "What would you like to say?" :
-                "Switched to \(destination.name). Your draft is ready to edit or review.",
-                project: destination.name, react: false)
+            startGuidedMessage(destination)
             return
         }
         if guidedMessage.isActive {
@@ -2933,7 +3580,31 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             browseCodexThreads()
             return
         case .open(let names):
-            openLauncherApps(names, draft: text)
+            runAppCommand(names, action: .open, draft: text)
+            return
+        case .switchTo(let names):
+            runAppCommand(names, action: .switchTo, draft: text)
+            return
+        case .hide(let names):
+            runAppCommand(names, action: .hide, draft: text)
+            return
+        case .quit(let names):
+            runAppCommand(names, action: .quit, draft: text)
+            return
+        case .folder(let folder):
+            openDesktopFolder(folder, draft: text)
+            return
+        case .website(let website):
+            completeDesktopCommand(NSWorkspace.shared.open(website.url), draft: text,
+                success: "Opened \(website.title)", failure: "Couldn't open \(website.title)")
+            return
+        case .copy(let body):
+            copyDesktopText(body, draft: text)
+            return
+        case .showDesktopUnavailable:
+            dot.worry()
+            showBubble("I can't reliably show Desktop with a supported macOS command. You can open the Desktop folder instead.",
+                       project: "Eden", react: false)
             return
         case .invalidAppReference:
             dot.worry()
@@ -2943,13 +3614,26 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         if answeringOther && provider == .claude { answer(nil, other: text); return }
         if handleTodo(text) { return }
-        showBubble("I can open installed apps and show your Codex conversations. For CLI messages, use Advanced → Send Draft to Terminal.",
+        if LauncherCommandParser.isExplicitDesktopCommand(text) { dot.worry() }
+        showBubble("Try Open, Switch to, Hide or Quit an app; Open Downloads; or Copy text: hello. For CLI messages, use Advanced → Send Draft to Terminal.",
                    project: "Eden", react: false)
+    }
+
+    private func startGuidedMessage(_ destination: GuidedMessageDestination, preserveTypedDraft: Bool = false) {
+        if preserveTypedDraft && quickSavedDraft == nil { quickSavedDraft = field.stringValue }
+        let previousDraft = guidedMessage.draft
+        guidedMessage.start(destination)
+        field.stringValue = previousDraft ?? ""
+        resetPlaceholder("Your message for \(destination.name)…")
+        showBubble(previousDraft == nil ? "What would you like to say?" :
+            "Switched to \(destination.name). Your draft is ready to edit or review.",
+            project: destination.name, react: false)
     }
 
     private func cancelGuidedMessage() {
         guidedMessage.cancel()
-        field.stringValue = ""
+        field.stringValue = quickSavedDraft ?? ""
+        quickSavedDraft = nil
         resetPlaceholder()
     }
 
@@ -2969,7 +3653,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             guidedMessage.edit()
             field.stringValue = draft
             showBubble("Edit your draft, then press Return to review it.", project: destination.name, react: false)
-            panel.makeKeyAndOrderFront(nil); panel.makeFirstResponder(field)
+            chatPanel.makeKeyAndOrderFront(nil); chatPanel.makeFirstResponder(field)
         default:
             cancelGuidedMessage()
             showBubble("Okay, message cancelled.", project: "Eden", react: false)
@@ -2986,12 +3670,16 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             return
         }
         sending = true
+        dot.processing = true
         let finish: (Bool, String) -> Void = { [weak self] opened, place in
             guard let self else { return }
             self.sending = false
+            self.dot.processing = false
             if opened {
+                self.dot.happy()
                 self.guidedMessage.cancel()
-                self.field.stringValue = ""
+                self.field.stringValue = self.quickSavedDraft ?? ""
+                self.quickSavedDraft = nil
                 self.resetPlaceholder()
                 self.setOpen(false)
                 self.showBubble("Copied. \(place) Choose your conversation, then paste and send.",
@@ -3105,26 +3793,68 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         paste(text, to: tty, provider: selected)
     }
 
-    private func openLauncherApps(_ names: [String], draft: String) {
+    private func completeDesktopCommand(_ success: Bool, draft: String, success successText: String,
+                                        failure failureText: String, preserveDraft: Bool = false) {
+        if success && !preserveDraft && field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == draft {
+            field.stringValue = ""
+        }
+        if success { dot.happy() } else { dot.worry() }
+        showBubble(success ? successText + "." : failureText + ". Draft kept.", project: "Eden", react: false)
+    }
+
+    private func copyDesktopText(_ text: String, draft: String, preserveDraft: Bool = false) {
+        let pasteboard = NSPasteboard.general
+        let saved = clipboardItems(pasteboard)
+        pasteboard.clearContents()
+        let copied = pasteboard.setString(text, forType: .string)
+        if !copied { restoreClipboard(pasteboard, items: saved, ifUnchanged: pasteboard.changeCount) }
+        completeDesktopCommand(copied, draft: draft, success: "Copied to your clipboard",
+                               failure: "Couldn't copy that text", preserveDraft: preserveDraft)
+    }
+
+    private func openDesktopFolder(_ folder: DesktopFolder, draft: String, preserveDraft: Bool = false) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let url: URL?
+        switch folder {
+        case .desktop: url = home.appendingPathComponent("Desktop", isDirectory: true)
+        case .documents: url = home.appendingPathComponent("Documents", isDirectory: true)
+        case .downloads: url = home.appendingPathComponent("Downloads", isDirectory: true)
+        case .applications: url = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        case .edenProject:
+            url = EdenProjectLocation.resolve(configured: UserDefaults.standard.string(forKey: "edenProjectFolderPath"), home: home)
+        }
+        guard let url, (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else {
+            completeDesktopCommand(false, draft: draft, success: "", failure: "Couldn't find the \(folder.title) folder",
+                                   preserveDraft: preserveDraft)
+            return
+        }
+        completeDesktopCommand(NSWorkspace.shared.open(url), draft: draft,
+                               success: "Opened \(folder.title)", failure: "Couldn't open \(folder.title)",
+                               preserveDraft: preserveDraft)
+    }
+
+    private func runAppCommand(_ names: [String], action: DesktopAppAction, draft: String) {
         launcherInProgress = true
         sending = true
+        dot.processing = true
         showBubble("Finding installed apps…", project: "apps", react: false)
         // A fresh discovery for every command includes newly installed apps.
         LauncherAppDiscovery.discover(names: names) { [weak self] catalog in
-            self?.launchRequestedApps(names, catalog: catalog, draft: draft, index: 0,
+            self?.launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: 0,
                                       results: [], allSucceeded: true)
         }
     }
 
-    private func launchRequestedApps(_ names: [String], catalog: [InstalledApplication], draft: String,
+    private func launchRequestedApps(_ names: [String], action: DesktopAppAction, catalog: [InstalledApplication], draft: String,
                                      index: Int, results: [String], allSucceeded: Bool) {
         guard index < names.count else {
             sending = false
             launcherInProgress = false
+            dot.processing = false
             if allSucceeded && field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == draft {
                 field.stringValue = ""
             }
-            if !allSucceeded { dot.worry() }
+            if allSucceeded { dot.happy() } else { dot.worry() }
             showBubble(results.joined(separator: "; ") + (allSucceeded ? "." : ". Draft kept."),
                        project: "apps", react: false)
             return
@@ -3135,7 +3865,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         let approximate: Bool
         switch resolution {
         case .missing:
-            launchRequestedApps(names, catalog: catalog, draft: draft, index: index + 1,
+            launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: index + 1,
                                 results: results + ["Couldn't find \(name)"], allSucceeded: false)
             return
         case .exact(let apps), .alias(let apps): matches = apps; approximate = false
@@ -3143,26 +3873,26 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         }
         let chosen: InstalledApplication?
         if matches.count == 1 && !approximate { chosen = matches[0] }
-        else { chosen = chooseLauncherApp(matches, for: name, approximate: approximate) }
+        else { chosen = chooseLauncherApp(matches, for: name, approximate: approximate, action: action) }
         guard let app = chosen else {
-            launchRequestedApps(names, catalog: catalog, draft: draft, index: index + 1,
+            launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: index + 1,
                                 results: results + ["Skipped \(name)"], allSucceeded: false)
             return
         }
-        launchInstalledApp(app) { [weak self] success, description in
-            self?.launchRequestedApps(names, catalog: catalog, draft: draft, index: index + 1,
+        performAppAction(action, on: app) { [weak self] success, description in
+            self?.launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: index + 1,
                                       results: results + [description], allSucceeded: allSucceeded && success)
         }
     }
 
     private func chooseLauncherApp(_ apps: [InstalledApplication], for name: String,
-                                   approximate: Bool) -> InstalledApplication? {
+                                   approximate: Bool, action: DesktopAppAction) -> InstalledApplication? {
         let alert = NSAlert()
         alert.messageText = approximate ? "Choose an app for \(name)" : "Several apps match \(name)"
         alert.informativeText = approximate
             ? "No exact app matched. Choose explicitly; Eden won't guess."
-            : "Choose which installed copy to open."
-        alert.addButton(withTitle: "Open selected")
+            : "Choose which installed copy to \(action.choiceVerb.lowercased())."
+        alert.addButton(withTitle: "\(action.choiceVerb) selected")
         alert.addButton(withTitle: "Skip")
         let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 460, height: 28), pullsDown: false)
         picker.addItems(withTitles: apps.map { "\($0.displayName) · \($0.url.path)" })
@@ -3174,16 +3904,76 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         return apps[picker.indexOfSelectedItem]
     }
 
+    private func runningCopy(of app: InstalledApplication, preferredPID: pid_t? = nil) -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first {
+            !$0.isTerminated && $0.bundleIdentifier == app.bundleID &&
+                (preferredPID == nil || $0.processIdentifier == preferredPID) &&
+                $0.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
+        }
+    }
+
+    private func performAppAction(_ action: DesktopAppAction, on app: InstalledApplication,
+                                  preferredPID: pid_t? = nil,
+                                  completion: @escaping (Bool, String) -> Void) {
+        guard let current = InstalledApplication(url: app.url), current.bundleID == app.bundleID else {
+            completion(false, "\(app.displayName) changed or is no longer available")
+            return
+        }
+        switch action {
+        case .open: launchInstalledApp(app, completion: completion)
+        case .switchTo, .hide, .quit:
+            guard let running = runningCopy(of: app, preferredPID: preferredPID) else {
+                completion(false, "\(app.displayName) isn't running")
+                return
+            }
+            guard running.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+                completion(false, "Use Eden's menu to hide or quit Eden")
+                return
+            }
+            switch action {
+            case .switchTo:
+                let ok = running.activate(options: [.activateAllWindows])
+                completion(ok, ok ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
+            case .hide:
+                let ok = running.hide()
+                completion(ok, ok ? "Hid \(app.displayName)" : "Couldn't hide \(app.displayName)")
+            case .quit:
+                let alert = NSAlert()
+                alert.messageText = "Quit \(app.displayName)?"
+                alert.informativeText = "Unsaved work could be affected. \(app.displayName) may ask you to save before it quits. Eden will never force quit it."
+                alert.addButton(withTitle: "Quit \(app.displayName)")
+                alert.addButton(withTitle: "Cancel")
+                NSApp.activate(ignoringOtherApps: true)
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    completion(false, "Cancelled quitting \(app.displayName)")
+                    return
+                }
+                guard running.terminate() else {
+                    completion(false, "Couldn't request \(app.displayName) to quit")
+                    return
+                }
+                func checkQuit(_ attempts: Int) {
+                    if running.isTerminated {
+                        completion(true, "Quit \(app.displayName)")
+                    } else if attempts >= 20 {
+                        completion(false, "\(app.displayName) hasn't quit yet")
+                    } else {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { checkQuit(attempts + 1) }
+                    }
+                }
+                checkQuit(0)
+            case .open: break
+            }
+        }
+    }
+
     private func launchInstalledApp(_ app: InstalledApplication,
                                     completion: @escaping (Bool, String) -> Void) {
         guard let current = InstalledApplication(url: app.url), current.bundleID == app.bundleID else {
             completion(false, "\(app.displayName) changed or is no longer available")
             return
         }
-        let running = NSWorkspace.shared.runningApplications.first {
-            !$0.isTerminated && $0.bundleIdentifier == app.bundleID &&
-                $0.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
-        }
+        let running = runningCopy(of: app)
         if let running {
             let activated = running.activate(options: [.activateAllWindows])
             completion(activated, activated ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
@@ -3249,14 +4039,14 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
             return v.isEmpty ? nil : v
         }
         func matches(_ pat: String) -> Bool { s.range(of: pat, options: [.regularExpression, .caseInsensitive]) != nil }
-        let done = { self.field.stringValue = ""; self.setOpen(false); self.panel.resignKey(); self.lastApp?.activate() }
+        let done = { self.field.stringValue = ""; self.setOpen(false); self.chatPanel.resignKey(); self.lastApp?.activate() }
 
         if let item = grab("^" + T + #"\s*[:\-–]\s*(.+)$"#)
             ?? grab(#"^(?:please\s+|can you\s+)*add\s+(.+?)\s+to\s+(?:my\s+|the\s+)?"# + T + #"(?:\s+list)?[.!?]*$"#)
             ?? grab(#"^(?:put|stick|write)\s+(.+?)\s+on\s+(?:my\s+|the\s+)?"# + T + #"(?:\s+list)?[.!?]*$"#) {
             todos.append(Todo(id: UUID().uuidString, text: String(item.prefix(200)), added: Date().timeIntervalSince1970, done: nil))
             saveTodosNow()
-            done(); dot.hop(); dot.sparkT = dot.t
+            done(); dot.proud()
             showBubble("added ✓  " + item, project: "to-do", react: false)
             return true
         }
@@ -3292,7 +4082,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     }
     func todosChanged() {
         todoBadge.n = todos.filter { $0.done == nil }.count
-        if !open { fitCollapsed() }; lay()
+        lay()
         if todoPanel?.isVisible == true { showTodoList() }
     }
 
@@ -3366,7 +4156,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
     @objc func toggleTodo(_ b: NSButton) {
         guard let id = b.identifier?.rawValue, let i = todos.firstIndex(where: { $0.id == id }) else { return }
         todos[i].done = todos[i].done == nil ? Date().timeIntervalSince1970 : nil
-        if todos[i].done != nil { dot.hop(); dot.sparkT = dot.t }
+        if todos[i].done != nil { dot.proud() }
         saveTodosNow()
     }
     @objc func deleteTodo(_ b: NSButton) {
@@ -3675,12 +4465,16 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextVie
         let d = UserDefaults.standard, today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
         if d.double(forKey: "fedDay") != today { d.set(today, forKey: "fedDay"); d.set(0, forKey: "fed") }
         d.set(d.integer(forKey: "fed") + 1, forKey: "fed"); dot.fed = d.integer(forKey: "fed")
-        // the goo springs up and throws a paper plane across the bar to "→ Terminal", then lands with a splat
-        dot.throwIt()
+        // Eden uses its success sprites; the paper plane belongs to the explicit original-pet override.
+        if dot.useCat { dot.happy() } else { dot.throwIt() }
         sending = true
         let from = NSPoint(x: dot.frame.minX + 16, y: dot.frame.midY + 4)
         let to = NSPoint(x: status.frame.minX + 30, y: status.frame.midY - 2)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.fx.launch(from: from, to: to, color: self.dot.colors.body) }
+        if !dot.useCat {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.fx.launch(from: from, to: to, color: self.dot.colors.body)
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) { self.sending = false; self.setOpen(false) }
     }
 }
