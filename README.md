@@ -1,6 +1,8 @@
-# Eden
+# Eden 🐱
 
-Eden is a lavender pixel cat and native macOS desktop companion. Click the cat to open its compact chat. It can launch installed apps from explicit commands such as “Open Figma and Codex,” guide you through copying a message to ChatGPT or Claude, and browse local Codex threads. Advanced Claude Code and Codex CLI Terminal controls remain available from the pet and menu bar menus.
+Eden is a pixel-art macOS desktop companion featuring a lavender cat. Click the cat to open a compact chat, use its universal macOS app launcher with commands such as “Open Figma and Codex,” or browse local Codex threads. Advanced Claude Code and Codex CLI Terminal controls remain available from the pet and menu bar menus.
+
+Guided messaging for ChatGPT and Claude helps you compose a message, copies it to the clipboard after confirmation, and opens the destination app or website. You choose the conversation, paste, and send it yourself. Eden does not directly send to existing ChatGPT or Claude conversations.
 
 The app lives in this repository at `~/Documents/GitHub/Eden Bot`. Internal Swift names, Claude hook paths, and `~/Library/Application Support/Mochi` remain unchanged so existing data and integrations continue to work.
 
@@ -40,3 +42,9 @@ macOS may still show an existing Login Item or privacy permission under the old 
 - Use **Advanced** for optional Terminal provider and destination controls. These require an existing, verified CLI session.
 
 The legacy data directory at `~/Library/Application Support/Mochi` and the existing Claude hooks are intentionally unchanged by this rename.
+
+## Credits and licence
+
+Created and developed by [Kate Tacastacas](https://kateafable.com).
+
+Based on the [original Mochi project](https://github.com/jessawolfe-ux/mochi), created by [Jessa Wolfe](https://jessa.art/). The repository retains the original MIT licence and Jessa Wolfe's copyright notice in [LICENSE](LICENSE).
