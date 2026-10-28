@@ -1,4 +1,9 @@
 #!/bin/bash
+# This upstream installer builds Mochi.app and modifies Claude Code hooks. Eden
+# uses the isolated local builder; keep the legacy installer inert during the
+# branding transition so it cannot recreate the old app or change user settings.
+echo "Eden: use ./scripts/install-local.sh --build-only to build, or --install after reviewing the existing Katescape.app." >&2
+exit 2
 # Mochi installer: asks what colour she should be, builds her, puts her in ~/Applications,
 # and connects her to Claude Code (adds a few hooks to ~/.claude/settings.json, backing it up first).
 #
@@ -90,16 +95,19 @@ if ! swiftc -O Sources/Mochi.swift -o build/Mochi.app/Contents/MacOS/Mochi 2> bu
     swiftc -O -vfsoverlay build/overlay.yaml Sources/Mochi.swift -o build/Mochi.app/Contents/MacOS/Mochi
   else cat build/errors.txt; exit 1; fi
 fi
-cp assets/Mochi.icns build/Mochi.app/Contents/Resources/Mochi.icns
+ICON_SOURCE="branding/Katescape.icns"
+[ -e "$ICON_SOURCE" ] || ICON_SOURCE="assets/Mochi.icns"
+[ -f "$ICON_SOURCE" ] && [ -s "$ICON_SOURCE" ] && sips -g format "$ICON_SOURCE" 2>/dev/null | grep -q 'format: icns' || { echo "  Invalid or missing .icns icon: $ICON_SOURCE" >&2; exit 1; }
+cp "$ICON_SOURCE" build/Mochi.app/Contents/Resources/Katescape.icns
 cat > build/Mochi.app/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Mochi</string>
-  <key>CFBundleDisplayName</key><string>Mochi</string>
+  <key>CFBundleName</key><string>Katescape</string>
+  <key>CFBundleDisplayName</key><string>Katescape</string>
   <key>CFBundleIdentifier</key><string>io.github.jessawolfe.mochi</string>
   <key>CFBundleExecutable</key><string>Mochi</string>
-  <key>CFBundleIconFile</key><string>Mochi</string>
+  <key>CFBundleIconFile</key><string>Katescape.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>

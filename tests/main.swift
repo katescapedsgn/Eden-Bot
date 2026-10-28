@@ -15,7 +15,25 @@ func makeApp(in root: URL, file: String, display: String, bundleName: String, id
     return app
 }
 
-let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("katescape-launcher-tests-\(UUID().uuidString)")
+let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("eden-launcher-tests-\(UUID().uuidString)")
+let screen = NSRect(x: 0, y: 0, width: 800, height: 600)
+let petFrame = NSRect(x: 100, y: 20, width: 144, height: 144)
+let chatFrame = PetChatLayout.targetFrame(current: petFrame, wasOpen: false, willOpen: true,
+                                          size: NSSize(width: 340, height: 168), visible: screen)
+check(chatFrame.width == 340 && chatFrame.height == 168, "compact chat dimensions")
+check(chatFrame.minX == 144 && chatFrame.minY == 20, "chat stays anchored near pet")
+let collapsedAgain = PetChatLayout.targetFrame(current: chatFrame, wasOpen: true, willOpen: false,
+                                                size: NSSize(width: 144, height: 144), visible: screen)
+check(collapsedAgain == petFrame, "collapse returns to pet position")
+let edgeChat = PetChatLayout.targetFrame(current: NSRect(x: 760, y: 520, width: 144, height: 144),
+                                         wasOpen: false, willOpen: true,
+                                         size: NSSize(width: 340, height: 168), visible: screen)
+check(edgeChat.maxX <= screen.maxX - 8 && edgeChat.maxY <= screen.maxY - 8,
+      "chat stays inside visible screen edges")
+let edgePet = PetChatLayout.targetFrame(current: edgeChat, wasOpen: true, willOpen: false,
+                                        size: NSSize(width: 144, height: 144), visible: screen)
+check(edgePet.maxX <= screen.maxX - 8 && edgePet.maxY <= screen.maxY - 8,
+      "collapsed pet stays inside visible screen edges")
 let standard = scratch.appendingPathComponent("Applications")
 let outside = scratch.appendingPathComponent("Elsewhere")
 try! FileManager.default.createDirectory(at: standard, withIntermediateDirectories: true)
@@ -30,6 +48,31 @@ _ = makeApp(in: standard, file: "Adobe Photoshop 2026", display: "Adobe Photosho
 let safariURL = makeApp(in: outside, file: "Safari", display: "Safari", bundleName: "Safari", id: "com.apple.Safari")
 
 let parser = LauncherCommandParser()
+let guidedParser = GuidedMessageIntentParser()
+check(guidedParser.parse("Message ChatGPT") == .chatGPT, "ChatGPT guided intent")
+check(guidedParser.parse("I want to send a message to ChatGPT") == .chatGPT, "ChatGPT full intent")
+check(guidedParser.parse("Send a message to Claude") == .claude, "Claude guided intent")
+check(guidedParser.parse("Message Claude") == .claude, "Claude short intent")
+check(guidedParser.parse("Open Claude") == nil, "app launcher remains separate")
+check(guidedParser.parse("Message Claude Code") == nil, "Claude Code remains separate")
+check(guidedParser.parse("Message Codex Desktop") == nil, "Codex Desktop remains separate")
+check(guidedParser.parse("What is ChatGPT?") == nil, "ordinary text is not a guided intent")
+var guided = GuidedMessageFlow()
+guided.start(.chatGPT)
+check(guided.state == .composing(.chatGPT), "begin composition")
+guided.cancel()
+check(guided.state == .idle, "cancel during composition")
+guided.start(.claude)
+check(guided.capture("Hello Claude"), "capture draft")
+check(guided.state == .confirming(.claude, "Hello Claude"), "confirmation state")
+guided.edit()
+check(guided.state == .editing(.claude, "Hello Claude"), "edit preserves draft")
+guided.start(.chatGPT)
+check(guided.state == .editing(.chatGPT, "Hello Claude"), "change destination preserves draft")
+check(guided.capture("Revised message"), "capture edited draft")
+check(guided.state == .confirming(.chatGPT, "Revised message"), "edited confirmation")
+guided.cancel()
+check(guided.state == .idle, "cancel confirmation")
 check(parser.parse("Open Photoshop") == .open(["Photoshop"]), "open parser")
 check(parser.parse("Launch Godot") == .open(["Godot"]), "launch parser")
 check(parser.parse("Open Spotify and Discord") == .open(["Spotify", "Discord"]), "multiple apps")
@@ -70,6 +113,18 @@ _ = makeApp(in: priorityRoot, file: "ChatGPT", display: "ChatGPT", bundleName: "
 let priorityApps = LauncherAppDiscovery.catalog(roots: [priorityRoot], registeredURLs: [])
 check(LauncherAppResolver.resolve("Codex", in: priorityApps) == .exact(priorityApps.filter { $0.bundleID == "example.codex" }),
       "exact name takes precedence over alias")
+check(GuidedMessageAppResolver.verifiedApp(for: .chatGPT, at: nil) == nil, "missing ChatGPT app uses website")
+let misleadingChatGPT = makeApp(in: priorityRoot, file: "ChatGPT Copy", display: "ChatGPT", bundleName: "ChatGPT", id: "com.openai.codex")
+check(GuidedMessageAppResolver.verifiedApp(for: .chatGPT, at: misleadingChatGPT) == nil,
+      "Codex Desktop must not be mistaken for ChatGPT")
+let verifiedChatGPT = makeApp(in: priorityRoot, file: "ChatGPT Verified", display: "ChatGPT", bundleName: "ChatGPT", id: "com.openai.chat")
+check(GuidedMessageAppResolver.verifiedApp(for: .chatGPT, at: verifiedChatGPT)?.bundleID == "com.openai.chat",
+      "verified ChatGPT desktop app")
+let verifiedClaude = makeApp(in: priorityRoot, file: "Claude", display: "Claude", bundleName: "Claude", id: "com.anthropic.claudefordesktop")
+check(GuidedMessageAppResolver.verifiedApp(for: .claude, at: verifiedClaude)?.bundleID == "com.anthropic.claudefordesktop",
+      "verified Claude desktop app")
+check(GuidedMessageDestination.chatGPT.website.absoluteString == "https://chatgpt.com/", "ChatGPT browser fallback")
+check(GuidedMessageDestination.claude.website.absoluteString == "https://claude.ai/", "Claude browser fallback")
 
 _ = makeApp(in: duplicateRoot, file: "Adobe Photoshop 2025", display: "Adobe Photoshop 2025", bundleName: "Adobe Photoshop 2025", id: "com.adobe.Photoshop.2025")
 let versions = LauncherAppDiscovery.catalog(roots: [standard, duplicateRoot], registeredURLs: [])

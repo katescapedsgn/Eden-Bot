@@ -1,4 +1,4 @@
-// Katescape: a floating desktop pet for local app commands and optional CLI integrations.
+// Eden: a floating desktop pet for local app commands and optional CLI integrations.
 // Return handles app commands and local to-dos. Terminal messaging requires the Advanced menu.
 // Claude Code can still supply replies, questions and progress through its existing hooks.
 import Cocoa
@@ -10,8 +10,16 @@ final class Panel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-final class Field: NSTextField {
-    var onSend: ((String) -> Void)?
+final class Field: NSTextView {
+    var stringValue: String {
+        get { string }
+        set { string = newValue; needsDisplay = true }
+    }
+    var placeholderAttributedString: NSAttributedString? { didSet { needsDisplay = true } }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if string.isEmpty { placeholderAttributedString?.draw(at: NSPoint(x: 2, y: 5)) }
+    }
     override func performKeyEquivalent(with e: NSEvent) -> Bool {
         // standard editing shortcuts inside the field
         if e.modifierFlags.contains(.command), let k = e.charactersIgnoringModifiers {
@@ -26,10 +34,42 @@ final class Field: NSTextField {
 
 // a view whose corners stay fully round as it grows and shrinks
 final class Pill: NSView {
-    override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); layer?.cornerRadius = s.height/2 }
+    override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); layer?.cornerRadius = min(s.height/2, 16) }
 }
 final class PillGlass: NSVisualEffectView {
-    override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); layer?.cornerRadius = s.height/2 }
+    override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); layer?.cornerRadius = min(s.height/2, 15) }
+}
+
+final class PetHandle: NSView {
+    var onClick: (() -> Void)?
+    private var downEvent: NSEvent?
+    private var dragged = false
+    override func mouseDown(with event: NSEvent) { downEvent = event; dragged = false }
+    override func mouseDragged(with event: NSEvent) {
+        guard let downEvent, !dragged else { return }
+        let a = downEvent.locationInWindow, b = event.locationInWindow
+        guard hypot(a.x - b.x, a.y - b.y) >= 5 else { return }
+        dragged = true
+        window?.performDrag(with: downEvent)
+    }
+    override func mouseUp(with event: NSEvent) {
+        if !dragged { onClick?() }
+        downEvent = nil
+    }
+}
+
+enum PetChatLayout {
+    static func targetFrame(current: NSRect, wasOpen: Bool, willOpen: Bool,
+                            size: NSSize, visible: NSRect?) -> NSRect {
+        let catCenter = current.minX + (wasOpen ? 28 : current.width / 2)
+        var frame = NSRect(x: catCenter - (willOpen ? 28 : size.width / 2), y: current.minY,
+                           width: size.width, height: size.height)
+        if let visible {
+            frame.origin.x = min(max(frame.minX, visible.minX + 8), visible.maxX - size.width - 8)
+            frame.origin.y = min(max(frame.minY, visible.minY + 8), visible.maxY - size.height - 8)
+        }
+        return frame
+    }
 }
 
 // MARK: - the goo
@@ -50,6 +90,61 @@ enum LauncherCommand: Equatable {
     case browseCodexThreads
     case open([String])
     case invalidAppReference
+}
+
+enum GuidedMessageDestination: String, Equatable {
+    case chatGPT, claude
+
+    var name: String { self == .chatGPT ? "ChatGPT" : "Claude" }
+    var bundleID: String { self == .chatGPT ? "com.openai.chat" : "com.anthropic.claudefordesktop" }
+    var website: URL { URL(string: self == .chatGPT ? "https://chatgpt.com/" : "https://claude.ai/")! }
+}
+
+struct GuidedMessageIntentParser {
+    func parse(_ input: String) -> GuidedMessageDestination? {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".!"))
+        let pattern = #"^(?:(?:i )?(?:want|would like) to )?(?:send (?:a )?message to|message|send to|write to) (chatgpt|claude)(?: please)?$"#
+        guard let range = text.range(of: pattern, options: .regularExpression) else { return nil }
+        let match = String(text[range])
+        return match.hasSuffix("chatgpt") || match.hasSuffix("chatgpt please") ? .chatGPT : .claude
+    }
+}
+
+struct GuidedMessageFlow {
+    enum State: Equatable {
+        case idle
+        case composing(GuidedMessageDestination)
+        case editing(GuidedMessageDestination, String)
+        case confirming(GuidedMessageDestination, String)
+    }
+    private(set) var state: State = .idle
+
+    var isActive: Bool { state != .idle }
+    var draft: String? {
+        switch state {
+        case .editing(_, let text), .confirming(_, let text): return text
+        default: return nil
+        }
+    }
+    mutating func start(_ destination: GuidedMessageDestination) {
+        if let draft { state = .editing(destination, draft) }
+        else { state = .composing(destination) }
+    }
+    mutating func capture(_ text: String) -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        switch state {
+        case .composing(let destination), .editing(let destination, _):
+            state = .confirming(destination, text); return true
+        case .confirming(let destination, _):
+            state = .confirming(destination, text); return true
+        case .idle: return false
+        }
+    }
+    mutating func edit() {
+        if case .confirming(let destination, let text) = state { state = .editing(destination, text) }
+    }
+    mutating func cancel() { state = .idle }
 }
 
 struct LauncherCommandParser {
@@ -117,6 +212,14 @@ struct InstalledApplication: Hashable {
     }
 
     var names: [String] { [displayName, bundleName, fileName] }
+}
+
+struct GuidedMessageAppResolver {
+    static func verifiedApp(for destination: GuidedMessageDestination, at url: URL?) -> InstalledApplication? {
+        guard let url, let app = InstalledApplication(url: url), app.bundleID == destination.bundleID,
+              app.names.contains(where: { $0.caseInsensitiveCompare(destination.name) == .orderedSame }) else { return nil }
+        return app
+    }
 }
 
 enum LauncherResolution: Equatable {
@@ -312,7 +415,7 @@ struct CodexProvider: ProviderAdapter {
     func matchesProcess(_ command: String) -> Bool { commandStarts(command, with: executable) }
 }
 
-// Katescape-owned Codex App Server connection. History reads and explicitly selected turns only.
+// Eden-owned Codex App Server connection. History reads and explicitly selected turns only.
 private final class CodexHistoryClient {
     enum Failure: LocalizedError {
         case unavailable(String)
@@ -421,7 +524,7 @@ private final class CodexHistoryClient {
         do { try process.run() } catch {
             stop(); done(.failure(Failure.unavailable("Could not start Codex App Server: \(error.localizedDescription)"))); return
         }
-        request("initialize", ["clientInfo": ["name": "katescape_history", "title": "Katescape History", "version": "0.1"]]) { [weak self] result in
+        request("initialize", ["clientInfo": ["name": "katescape_history", "title": "Eden History", "version": "0.1"]]) { [weak self] result in
             switch result {
             case .failure(let error): done(.failure(error))
             case .success:
@@ -563,7 +666,7 @@ private struct CodexSendDiagnostic {
         thread/list status at selection: \(listStatusAtSelection)
         thread/read before resume: \(readStatusBeforeResume)
         thread/read after rejection: \(readStatusAfterRejection)
-        Loaded in Katescape App Server after rejection: \(loadedInKatescapeServer)
+        Loaded in Eden App Server after rejection: \(loadedInKatescapeServer)
         """
     }
 }
@@ -679,6 +782,26 @@ func saveColor(_ c: NSColor) {
 }
 var mochiGoo = gooColors(savedColor())
 
+// Bundle sprites are optional so PB_PET_ART=mochi remains a development-only visual fallback.
+private enum CatSprites {
+    static func load(_ name: String, in state: String, count: Int, size: NSSize) -> [NSImage] {
+        (1...count).compactMap { number in
+            guard let url = Bundle.main.url(forResource: String(format: "%@_%02d", name, number),
+                                            withExtension: "png", subdirectory: "PetSprites/Eden/\(state)"),
+                  let image = NSImage(contentsOf: url), image.size == size else { return nil }
+            return image
+        }
+    }
+    static let idle = load("idle", in: "idle", count: 4, size: NSSize(width: 288, height: 288))
+    static let blink = load("blink", in: "blink", count: 4, size: NSSize(width: 288, height: 288))
+    static let sleeping = load("sleep", in: "sleeping", count: 3, size: NSSize(width: 288, height: 256))
+    static let thinking = load("thinking", in: "thinking", count: 4, size: NSSize(width: 288, height: 288))
+    static let happy = load("happy", in: "happy", count: 4, size: NSSize(width: 320, height: 320))
+    static var available: Bool {
+        idle.count == 4 && blink.count == 4 && sleeping.count == 3 && thinking.count == 4 && happy.count == 4
+    }
+}
+
 // a little goo blob drawn in chunky pixels. It breathes, blinks and follows the cursor; hops, throws, thinks,
 // sleeps, gets petted; and dresses for the time of day (coffee in the morning, sunglasses on Friday afternoon, a nightcap late)
 final class Goo: NSView {
@@ -692,6 +815,7 @@ final class Goo: NSView {
     var sparkT = -10.0, worryT = -10.0, throwT = -10.0, heartT = -10.0
     var lean = 0.0, leanV = 0.0          // springy sway, for wiggles and flings
     var nextBlink = 2.5, blinkT = -10.0
+    var catTime = 0.0, catNextBlink = 6.0, catBlinkStart = -10.0
     var look = 0.0, lookTo = 0.0, lookY = 0, nextLook = 4.0, greetUntil = -10.0
     var lastActive = 0.0, sleepSince: Double? = nil
     var hoverSince: Double? = nil
@@ -699,6 +823,8 @@ final class Goo: NSView {
 
     // for testing the outfits: PB_HOUR=8 or PB_WEEKDAY=6 (Friday) in the environment
     let env = ProcessInfo.processInfo.environment
+    var useCat: Bool { env["PB_PET_ART"] != "mochi" && CatSprites.available }
+    var catDrawSize: CGFloat = 28
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -727,6 +853,13 @@ final class Goo: NSView {
     func step() {
         t += 1.0/12
         if t > nextBlink { blinkT = t; nextBlink = t + 2.5 + Double.random(in: 0...3) }
+        if useCat && !sleeping && !isHidden && window?.isVisible == true {
+            catTime += 1.0/12
+            if catTime >= catNextBlink {
+                catBlinkStart = catTime
+                catNextBlink = catTime + 7 + Double.random(in: 0...5)
+            }
+        }
 
         // eyes follow the cursor when it's near, otherwise glance around now and then
         let m = NSEvent.mouseLocation
@@ -736,7 +869,8 @@ final class Goo: NSView {
             let dx = m.x - c.x, dy = m.y - c.y
             near = dx * dx + dy * dy < 260 * 260
             if near && t > greetUntil { lookTo = max(-1, min(1, dx / 70)); lookY = dy > 40 ? 1 : dy < -40 ? -1 : 0 }
-            over = abs(dx) < 15 && abs(dy) < 14
+            let enlargedCat = useCat && catDrawSize > 28
+            over = abs(dx) < (enlargedCat ? 54 : 15) && abs(dy) < (enlargedCat ? 58 : 14)
         }
         if !near && t > greetUntil {
             lookY = 0
@@ -769,7 +903,52 @@ final class Goo: NSView {
 
     var petting: Bool { if env["PB_MOOD"] == "pet" { return true }; if let h = hoverSince { return t - h > 0.6 } else { return false } }
 
+    private func drawCat() {
+        let neutralState = sleeping || thinking || asking || petting || t - worryT < 1.4
+        let blinkFrame = Int((catTime - catBlinkStart) * 12)
+        let image: NSImage
+        if !neutralState && (0..<4).contains(blinkFrame) { image = CatSprites.blink[blinkFrame] }
+        else if neutralState { image = CatSprites.idle[0] }
+        else { image = CatSprites.idle[Int(catTime / 0.45) % 4] }
+
+        // Every frame uses the full 288-square canvas, so the paws keep one baseline.
+        let hopAge = t - hopT, throwAge = t - throwT
+        let hopLift = hopAge >= 0 && hopAge < 0.7 * Double(hops)
+            ? 1.5 * sin((hopAge.truncatingRemainder(dividingBy: 0.7) / 0.7) * .pi) : 0
+        let throwLift = throwAge >= 0 && throwAge < 0.72 ? 1.5 * sin(throwAge / 0.72 * .pi) : 0
+        let offsetX = max(-1, min(1, lean * 0.35)).rounded()
+        let context = NSGraphicsContext.current
+        let previousInterpolation = context?.imageInterpolation
+        context?.imageInterpolation = .none
+        image.draw(in: NSRect(x: 2 + offsetX, y: max(hopLift, throwLift).rounded(.down),
+                              width: catDrawSize, height: catDrawSize),
+                   from: NSRect(origin: .zero, size: image.size), operation: .sourceOver,
+                   fraction: 1, respectFlipped: true, hints: nil)
+        if let previousInterpolation { context?.imageInterpolation = previousInterpolation }
+
+        func cell(_ x: Int, _ y: Int, _ color: NSColor) {
+            color.setFill(); NSRect(x: CGFloat(x * 2), y: CGFloat(y * 2), width: 2, height: 2).fill()
+        }
+        let white = NSColor.white
+        if sleeping {
+            for (x, y) in [(13, 11), (14, 11), (14, 12), (13, 13), (14, 13)] { cell(x, y, white) }
+        } else if asking {
+            for (x, y) in [(12, 12), (13, 13), (14, 12), (14, 11), (13, 10), (13, 8)] { cell(x, y, white) }
+        } else if thinking {
+            for x in 11...13 where x - 11 <= Int(catTime * 2.5) % 3 { cell(x, 12, white) }
+        }
+        if petting || t - heartT < 1.6 {
+            let pink = rgb(1, 0.42, 0.62)
+            for (x, y) in [(12, 11), (14, 11), (12, 10), (13, 10), (14, 10), (13, 9)] { cell(x, y, pink) }
+        }
+        if t - sparkT < 1.4 {
+            for (x, y) in [(1, 11), (2, 12), (3, 11), (2, 10)] { cell(x, y, white) }
+        }
+        if t - worryT < 1.4 { cell(14, 10, rgb(1, 0.75, 0.4)); cell(14, 8, rgb(1, 0.75, 0.4)) }
+    }
+
     override func draw(_ r: NSRect) {
+        if useCat { drawCat(); return }
         let ox = 0.0 as CGFloat
         func cell(_ x: Int, _ y: Int, _ c: NSColor) {
             guard x >= 0, x < cols, y >= 0, y < rows else { return }
@@ -1032,7 +1211,7 @@ final class Social: NSView {
     var counts: [(site: SocialSite, n: Int)] = [] { didSet { needsDisplay = true } }
     let px: CGFloat = 2
     let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
-    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+    override func hitTest(_ p: NSPoint) -> NSView? { super.hitTest(p) }
 
     func label(_ n: Int) -> String { n > 99 ? "99+" : "\(n)" }
     func slot(_ n: Int) -> CGFloat { 14 + 3 + (label(n) as NSString).size(withAttributes: [.font: font]).width + 7 }
@@ -1064,7 +1243,7 @@ final class Social: NSView {
 final class TodoBadge: NSView {
     var n = 0 { didSet { needsDisplay = true } }
     let px: CGFloat = 2, font = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
-    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+    override func hitTest(_ p: NSPoint) -> NSView? { super.hitTest(p) }
     var width: CGFloat { n == 0 ? 0 : 17 + ("\(n)" as NSString).size(withAttributes: [.font: font]).width }
     override func draw(_ r: NSRect) {
         guard n > 0 else { return }
@@ -1115,7 +1294,7 @@ final class Wave: NSView {
     }
 }
 
-final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
+final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTextViewDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
     var provider = ProviderID(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .claude
     var pillProviderMenu: NSMenu?
     private var pillTerminalMenu: NSMenu?
@@ -1137,6 +1316,12 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     private var codexSendDiagnostic: CodexSendDiagnostic?
     var panel: Panel!
     var field: Field!
+    var inputScroll: NSScrollView!
+    var inputBackground: NSView!
+    var chatGlass: PillGlass!
+    var chatTitle: NSTextField!
+    var closeChatButton: Tap!
+    var petHandle: PetHandle!
     var status: NSTextField!
     var mini: Wave!
     var dot: Goo!
@@ -1171,6 +1356,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     var prevBtn: Tap!, nextBtn: Tap!, pageLabel: NSTextField!
     var sending = false
     private var launcherInProgress = false
+    private var guidedMessage = GuidedMessageFlow()
     var lastApp: NSRunningApplication?
     var open = false
 
@@ -1186,9 +1372,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     var seenVisitors: Set<String>? = nil
     var lastMidX: CGFloat = 0, lastMoveT = 0.0
 
-    // sizes: a small "Mochi" pill when collapsed, the full bar when open
-    let W: CGFloat = 560, H: CGFloat = 48
-    let w: CGFloat = 120, h: CGFloat = 34
+    // The collapsed window contains only the pet; the chat grows above it.
+    let W: CGFloat = 340, H: CGFloat = 168
+    let w: CGFloat = 144, h: CGFloat = 144
 
     // focus diary: what Mochi did lately, written out whenever it loses focus while the bar is open (to catch focus thieves)
     var recent: [String] = []
@@ -1215,29 +1401,33 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         let mouse = NSEvent.mouseLocation
         var scr = (NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main!).visibleFrame
         if let i = Int(ProcessInfo.processInfo.environment["PB_SCREEN"] ?? ""), i < NSScreen.screens.count { scr = NSScreen.screens[i].visibleFrame }
-        panel = Panel(contentRect: NSRect(x: scr.midX - w/2, y: scr.minY + 18, width: w, height: h),
+        let initialFrame = PetChatLayout.targetFrame(
+            current: NSRect(x: scr.midX - w/2, y: scr.minY + 18, width: w, height: h),
+            wasOpen: false, willOpen: false, size: NSSize(width: w, height: h), visible: scr)
+        panel = Panel(contentRect: initialFrame,
                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.delegate = self
 
-        // smoked glass pill: always dark, with a dark outer ring (reads on light screens) and a light inner ring (reads on dark ones)
+        // Transparent pet when collapsed; the smoked glass is shown only for chat.
         ring = Pill(frame: NSRect(x: 0, y: 0, width: w, height: h))
-        ring.wantsLayer = true; ring.layer?.cornerRadius = h/2
-        ring.layer?.borderWidth = 1; ring.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
+        ring.wantsLayer = true; ring.layer?.cornerRadius = 16
+        ring.layer?.borderWidth = 0; ring.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
         panel.contentView = ring
 
         let glass = PillGlass(frame: NSRect(x: 1, y: 1, width: w - 2, height: h - 2))
+        chatGlass = glass
         glass.autoresizingMask = [.width, .height]
         glass.appearance = NSAppearance(named: .darkAqua)
         glass.material = .hudWindow; glass.blendingMode = .behindWindow; glass.state = .active
-        glass.wantsLayer = true; glass.layer?.cornerRadius = (h - 2)/2; glass.layer?.masksToBounds = true
+        glass.wantsLayer = true; glass.layer?.cornerRadius = 15; glass.layer?.masksToBounds = true
         glass.layer?.borderWidth = 1; glass.layer?.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
         ring.addSubview(glass)
 
@@ -1247,47 +1437,78 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         tint.wantsLayer = true; tint.layer?.backgroundColor = NSColor(white: 0.06, alpha: 0.62).cgColor
         glass.addSubview(tint)
 
-        dot = Goo(frame: NSRect(x: 0, y: 0, width: 32, height: 28))
-        glass.addSubview(dot)
+        petHandle = PetHandle(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        petHandle.onClick = { [weak self] in self?.catClicked() }
+        ring.addSubview(petHandle)
+        dot = Goo(frame: NSRect(x: 0, y: 0, width: 132, height: 128))
+        ring.addSubview(dot)
         let d = UserDefaults.standard, today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
         dot.fed = d.double(forKey: "fedDay") == today ? d.integer(forKey: "fed") : 0
         visitors = Visitors(frame: NSRect(x: 0, y: 0, width: 80, height: 12))
         glass.addSubview(visitors)
         social = Social(frame: NSRect(x: 0, y: 0, width: 60, height: 14))
         glass.addSubview(social)
+        social.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clickedSocialBadge(_:))))
         todoBadge = TodoBadge(frame: NSRect(x: 0, y: 0, width: 40, height: 14))
         glass.addSubview(todoBadge)
+        todoBadge.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clickedTodoBadge(_:))))
         meter = NSTextField(labelWithString: "")
         meter.font = .monospacedSystemFont(ofSize: 10, weight: .medium); meter.textColor = cyanText
         glass.addSubview(meter)
 
-        // collapsed label
-        mini = Wave("Mochi")
+        // Kept for existing status updates, but never shown in the pet-only view.
+        mini = Wave("Eden")
         mini.font = .systemFont(ofSize: 13, weight: .medium)
         mini.textColor = NSColor(white: 1, alpha: 0.85)
         glass.addSubview(mini)
 
-        field = Field(frame: NSRect(x: 46, y: (H - 2 - 22)/2, width: W - 46 - 194, height: 22))
+        chatTitle = NSTextField(labelWithString: "Eden")
+        chatTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        chatTitle.textColor = .white
+        glass.addSubview(chatTitle)
+        closeChatButton = Tap(frame: .zero)
+        closeChatButton.title = "×"
+        closeChatButton.font = .systemFont(ofSize: 21, weight: .regular)
+        closeChatButton.isBordered = false
+        closeChatButton.target = self
+        closeChatButton.action = #selector(collapseChat)
+        closeChatButton.toolTip = "Close chat (draft kept)"
+        glass.addSubview(closeChatButton)
+
+        inputBackground = NSView(frame: .zero)
+        inputBackground.wantsLayer = true
+        inputBackground.layer?.cornerRadius = 10
+        inputBackground.layer?.backgroundColor = NSColor(white: 1, alpha: 0.08).cgColor
+        inputBackground.layer?.borderWidth = 1
+        inputBackground.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
+        glass.addSubview(inputBackground)
+        inputScroll = NSScrollView(frame: .zero)
+        inputScroll.drawsBackground = false
+        inputScroll.hasVerticalScroller = true
+        inputScroll.autohidesScrollers = true
+        inputScroll.borderType = .noBorder
+        glass.addSubview(inputScroll)
+        field = Field(frame: NSRect(x: 0, y: 0, width: 296, height: 60))
         resetPlaceholder()
         field.font = .systemFont(ofSize: 14); field.textColor = .white
-        field.isBordered = false; field.drawsBackground = false; field.focusRingType = .none
-        field.cell?.usesSingleLineMode = true; field.cell?.isScrollable = true; field.cell?.wraps = false
+        field.drawsBackground = false; field.isRichText = false
+        field.isHorizontallyResizable = false; field.isVerticallyResizable = true
+        field.textContainer?.widthTracksTextView = true
+        field.textContainer?.containerSize = NSSize(width: 296, height: CGFloat.greatestFiniteMagnitude)
+        field.textContainerInset = NSSize(width: 0, height: 4)
         field.delegate = self
-        glass.addSubview(field)
+        inputScroll.documentView = field
 
         status = NSTextField(labelWithString: "desktop commands")
         status.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
-        status.textColor = NSColor(white: 1, alpha: 0.6); status.alignment = .right
-        status.frame = NSRect(x: W - 2 - 186, y: (H - 2 - 14)/2, width: 166, height: 14)
+        status.textColor = NSColor(white: 1, alpha: 0.6); status.alignment = .left
+        status.frame = NSRect(x: 54, y: 16, width: W - 72, height: 14)
         status.cell?.lineBreakMode = .byTruncatingMiddle
         glass.addSubview(status)
 
         // on top of everything: the paper plane
         fx = Fx(frame: glass.bounds); fx.autoresizingMask = [.width, .height]
         glass.addSubview(fx)
-
-        // click the collapsed pill to open it (a drag still moves it)
-        ring.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(tapped(_:))))
 
         let menu = NSMenu()
         let browse = NSMenuItem(title: "Browse Codex Threads…", action: #selector(browseCodexThreads), keyEquivalent: "")
@@ -1298,15 +1519,16 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login); menu.addItem(.separator())
-        let paint = NSMenuItem(title: "Change Mochi's Color…", action: #selector(pickColor(_:)), keyEquivalent: "")
+        let paint = NSMenuItem(title: "Change Original Pet Color…", action: #selector(pickColor(_:)), keyEquivalent: "")
         paint.target = self; menu.addItem(paint); menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit Mochi", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit Eden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         // open at login: switched on once, the first time; after that the menu item decides
         if !UserDefaults.standard.bool(forKey: "loginSet") {
             UserDefaults.standard.set(true, forKey: "loginSet")
             do { try SMAppService.mainApp.register(); login.state = .on } catch { NSLog("login item: \(error)") }
         }
-        ring.menu = menu; glass.menu = menu
+        ring.menu = menu; glass.menu = menu; petHandle.menu = menu
+        social.menu = menu; todoBadge.menu = menu
 
         lay()
         panel.orderFrontRegardless()
@@ -1334,22 +1556,32 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         }
     }
 
-    // MARK: the menu bar goo
+    // MARK: the menu bar pet
 
     func makeStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        // a 9×8 pixel goo (a template image, so it follows the menu bar's light or dark look)
-        let shape = ["..XXXXX..", ".XXXXXXX.", "XXXXXXXXX", "XX.XXX.XX", "XX.XXX.XX", "XXXXXXXXX", "XXXXXXXXX", "XXXXXXXXXXX"]
-        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
-            NSColor.black.setFill()
-            for (row, line) in shape.enumerated() { for (col, ch) in line.enumerated() where ch == "X" {
-                NSRect(x: CGFloat(col) * 1.6 + 0.2, y: CGFloat(row) * 1.6 + 3.4, width: 1.6, height: 1.6).fill()
-            } }
-            return true
+        if ProcessInfo.processInfo.environment["PB_PET_ART"] != "mochi", let cat = CatSprites.idle.first {
+            let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+                NSGraphicsContext.current?.imageInterpolation = .none
+                cat.draw(in: rect, from: NSRect(origin: .zero, size: cat.size),
+                         operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+                return true
+            }
+            img.isTemplate = false
+            statusItem.button?.image = img
+        } else {
+            let shape = ["..XXXXX..", ".XXXXXXX.", "XXXXXXXXX", "XX.XXX.XX", "XX.XXX.XX", "XXXXXXXXX", "XXXXXXXXX", "XXXXXXXXXXX"]
+            let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+                NSColor.black.setFill()
+                for (row, line) in shape.enumerated() { for (col, ch) in line.enumerated() where ch == "X" {
+                    NSRect(x: CGFloat(col) * 1.6 + 0.2, y: CGFloat(row) * 1.6 + 3.4, width: 1.6, height: 1.6).fill()
+                } }
+                return true
+            }
+            img.isTemplate = true
+            statusItem.button?.image = img
         }
-        img.isTemplate = true
-        statusItem.button?.image = img
-        statusItem.button?.toolTip = "Mochi"
+        statusItem.button?.toolTip = "Eden"
         let m = NSMenu(); m.delegate = self; statusItem.menu = m
     }
 
@@ -1358,18 +1590,18 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         guard m === statusItem?.menu else { return }
         m.removeAllItems()
         func item(_ t: String, _ a: Selector) { let i = NSMenuItem(title: t, action: a, keyEquivalent: ""); i.target = self; m.addItem(i) }
-        item("Find Mochi", #selector(findMochi))
-        item("Ask Katescape…", #selector(messageMochi))
+        item("Find Eden", #selector(findMochi))
+        item("Ask Eden…", #selector(messageMochi))
         let n = todos.filter { $0.done == nil }.count
         item(n > 0 ? "To-do list (\(n))" : "To-do list", #selector(openTodoFromMenu))
-        item(panel.isVisible ? "Hide Mochi" : "Show Mochi", #selector(toggleShown))
+        item(panel.isVisible ? "Hide Eden" : "Show Eden", #selector(toggleShown))
         m.addItem(.separator())
         item("Browse Codex Threads…", #selector(browseCodexThreads))
         let advanced = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
         advanced.submenu = makeAdvancedMenu(); m.addItem(advanced)
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self; login.state = SMAppService.mainApp.status == .enabled ? .on : .off; m.addItem(login)
-        m.addItem(withTitle: "Quit Mochi", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        m.addItem(withTitle: "Quit Eden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     func makeProviderMenu() -> NSMenu {
@@ -1513,12 +1745,12 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         if !UserDefaults.standard.bool(forKey: "codexHistoryConsent") {
             let alert = NSAlert()
             alert.messageText = "Browse local Codex threads?"
-            alert.informativeText = "Katescape will start its own local Codex App Server connection to browse thread titles, directories and selected transcript text. Browsing is read-only. Thread data stays in memory."
+            alert.informativeText = "Eden will start its own local Codex App Server connection to browse thread titles, directories and selected transcript text. Browsing is read-only. Thread data stays in memory."
             alert.addButton(withTitle: "Allow browsing")
             alert.addButton(withTitle: "Cancel")
             NSApp.activate(ignoringOtherApps: true)
             guard alert.runModal() == .alertFirstButtonReturn else {
-                showBubble("Okay, I didn't open Codex conversations.", project: "Katescape", react: false)
+                showBubble("Okay, I didn't open Codex conversations.", project: "Eden", react: false)
                 return
             }
             UserDefaults.standard.set(true, forKey: "codexHistoryConsent")
@@ -1585,7 +1817,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
                 }
                 let parsed = values.compactMap(CodexHistoryClient.Thread.init)
                 guard parsed.count == values.count else {
-                    self.historyError("Codex returned thread metadata Katescape cannot safely display."); return
+                    self.historyError("Codex returned thread metadata Eden cannot safely display."); return
                 }
                 self.discoveredThreads.append(contentsOf: parsed)
                 if let next = response["nextCursor"] as? String, !next.isEmpty, page < 3, !seen.contains(next) {
@@ -1698,7 +1930,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     private func historyError(_ message: String, closeConnection: Bool = true) {
         if closeConnection { historyClient?.stop(); historyClient = nil; discoveredThreads = [] }
         showBubble("I couldn't load Codex conversations. Your draft is still here.",
-                   project: "Katescape", react: false)
+                   project: "Eden", react: false)
         let alert = NSAlert()
         alert.messageText = "Codex threads unavailable"
         alert.informativeText = message
@@ -1741,7 +1973,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             return p
         }
         visitorNote = here.isEmpty ? "" : "Here now:\n" + here.map { "\($0["name"] as? String ?? "Someone") · \(place($0))" }.joined(separator: "\n")
-        ring.toolTip = tooltipText()
+        ring.toolTip = tooltipText(); petHandle.toolTip = tooltipText()
         // someone new: the goo says hi, and the bubble says who
         let ids = Set(here.compactMap { $0["id"] as? String })
         if let seen = seenVisitors, let m = here.first(where: { !seen.contains($0["id"] as? String ?? "") }) {
@@ -1791,7 +2023,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         if (ProcessInfo.processInfo.environment["PB_DEMO"] ?? "").contains("social") { best = ["ig": 3, "li": 12, "th": 1] }   // for checking the look
         socialTabs = where_
         social.counts = socialSites.compactMap { s in (best[s.key] ?? 0) > 0 ? (s, best[s.key]!) : nil }
-        ring.toolTip = tooltipText()
+        ring.toolTip = tooltipText(); petHandle.toolTip = tooltipText()
         // a count went up: Mochi hops, and the bubble says where
         if let seen = socialSeen {
             let ups = socialSites.compactMap { s -> String? in
@@ -1826,71 +2058,81 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
     }
 
-    // the collapsed pill's width: goo, label, visitors and social badges
-    var collapsedWidth: CGFloat {
-        mini.sizeToFit()
-        meter.sizeToFit()
-        return 41 + mini.frame.width + (meterText.isEmpty ? 0 : 8 + meter.frame.width) + (visitors.tints.isEmpty ? 0 : 8 + visitors.width)
-            + (social.counts.isEmpty ? 0 : 10 + social.width) + (todoBadge.n == 0 ? 0 : 10 + todoBadge.width) + 12
-    }
+    var collapsedWidth: CGFloat { w }
 
     func fitCollapsed() {
         guard !open else { return }
         let W2 = collapsedWidth, f = panel.frame
-        if abs(f.width - W2) > 0.5 { panel.setFrame(NSRect(x: f.midX - W2/2, y: f.minY, width: W2, height: f.height), display: true) }
+        if abs(f.width - W2) > 0.5 { panel.setFrame(NSRect(x: f.midX - W2/2, y: f.minY, width: W2, height: h), display: true) }
     }
 
-    // place the dot and labels for the current state
+    // The pet stays at the lower left while chat grows above it.
     func lay() {
-        let gh = (open ? H : h) - 2
-        dot.frame.origin = NSPoint(x: open ? 10 : 7, y: ((gh - 28)/2).rounded())
-        mini.sizeToFit()
-        mini.frame.origin = NSPoint(x: 41, y: (gh - mini.frame.height)/2)
-        mini.isHidden = open
-        mini.bobbing = mini.stringValue == "Mochi" && !dot.sleeping
+        dot.catDrawSize = open ? 28 : 128
+        dot.frame = NSRect(x: open ? 12 : 6, y: open ? 12 : 8,
+                           width: open ? 32 : 132, height: open ? 28 : 128)
+        dot.needsDisplay = true
+        petHandle.frame = NSRect(x: open ? 8 : 0, y: open ? 8 : 0,
+                                 width: open ? 44 : w, height: open ? 40 : h)
+        chatGlass.isHidden = !open
+        mini.isHidden = true
+        guard open else { return }
+        chatTitle.frame = NSRect(x: 16, y: H - 31, width: 245, height: 20)
+        closeChatButton.frame = NSRect(x: W - 36, y: H - 37, width: 28, height: 28)
+        var x: CGFloat = 16
+        visitors.frame = NSRect(x: x, y: H - 57, width: max(visitors.width, 1), height: 12)
+        visitors.isHidden = visitors.tints.isEmpty
+        if !visitors.isHidden { x = visitors.frame.maxX + 8 }
+        social.frame = NSRect(x: x, y: H - 59, width: max(social.width, 1), height: 14)
+        social.isHidden = social.counts.isEmpty
+        if !social.isHidden { x = social.frame.maxX + 8 }
+        todoBadge.frame = NSRect(x: x, y: H - 57, width: max(todoBadge.width, 1), height: 14)
+        todoBadge.isHidden = todoBadge.n == 0
+        if !todoBadge.isHidden { x = todoBadge.frame.maxX + 8 }
         meter.sizeToFit()
-        meter.frame.origin = NSPoint(x: mini.frame.maxX + 8, y: ((gh - meter.frame.height)/2).rounded())
-        meter.isHidden = open || meterText.isEmpty
-        var x = meterText.isEmpty ? mini.frame.maxX : meter.frame.maxX
-        visitors.frame = NSRect(x: x + 8, y: ((gh - 10)/2).rounded(), width: max(visitors.width, 1), height: 12)
-        visitors.isHidden = open || visitors.tints.isEmpty
-        if !visitors.tints.isEmpty { x = visitors.frame.maxX }
-        social.frame = NSRect(x: x + 10, y: ((gh - 14)/2).rounded(), width: max(social.width, 1), height: 14)
-        social.isHidden = open || social.counts.isEmpty
-        if !social.counts.isEmpty { x = social.frame.maxX }
-        todoBadge.frame = NSRect(x: x + 10, y: ((gh - 14)/2).rounded(), width: max(todoBadge.width, 1), height: 14)
-        todoBadge.isHidden = open || todoBadge.n == 0
-        field.isHidden = !open
-        status.isHidden = !open
+        meter.frame.origin = NSPoint(x: min(x, W - meter.frame.width - 12), y: H - 58)
+        meter.isHidden = meterText.isEmpty
+        inputBackground.frame = NSRect(x: 12, y: 42, width: W - 24, height: 67)
+        inputScroll.frame = NSRect(x: 19, y: 48, width: W - 38, height: 55)
+        status.frame = NSRect(x: 54, y: 17, width: W - 68, height: 15)
+        inputScroll.isHidden = false
+        status.isHidden = false
     }
 
-    @objc func tapped(_ g: NSClickGestureRecognizer) {
-        guard !open else { return }
+    private func catClicked() {
+        if open { setOpen(false); return }
         if todoPanel?.isVisible == true && (todoPanel?.alphaValue ?? 0) > 0.5 { hideTodoList(); return }
-        // the checklist badge opens the to-do list
-        if !todoBadge.isHidden, todoBadge.bounds.insetBy(dx: -5, dy: -8).contains(g.location(in: todoBadge)) { toggleTodoList(); return }
-        // a click on a social badge jumps to that tab; anywhere else opens the bar
-        if !social.isHidden, let s = social.site(at: g.location(in: social)), social.bounds.contains(g.location(in: social)) { openSocial(s); return }
         setOpen(true)
     }
+
+    @objc private func clickedSocialBadge(_ gesture: NSClickGestureRecognizer) {
+        if let site = social.site(at: gesture.location(in: social)) { openSocial(site) }
+    }
+
+    @objc private func clickedTodoBadge(_ gesture: NSClickGestureRecognizer) { toggleTodoList() }
+
+    @objc private func collapseChat() { setOpen(false) }
 
     // grow or shrink around the bar's current bottom centre
     func setOpen(_ o: Bool) {
         note("setOpen \(o)")
         guard o != open else { return }
+        let wasOpen = open
         open = o
         let f = panel.frame
         let size = o ? NSSize(width: W, height: H) : NSSize(width: collapsedWidth, height: h)
-        var to = NSRect(x: f.midX - size.width/2, y: f.minY, width: size.width, height: size.height)
-        if let s = panel.screen?.visibleFrame { to.origin.x = min(max(to.minX, s.minX + 8), s.maxX - size.width - 8) }
-        if !o { field.isHidden = true; status.isHidden = true }
+        let to = PetChatLayout.targetFrame(current: f, wasOpen: wasOpen, willOpen: o, size: size,
+                                           visible: panel.screen?.visibleFrame)
+        panel.hasShadow = o
+        ring.layer?.borderWidth = o ? 1 : 0
+        if !o { inputScroll.isHidden = true; status.isHidden = true; chatGlass.isHidden = true }
+        else { chatGlass.isHidden = false }
         NSAnimationContext.runAnimationGroup({ c in
             c.duration = 0.22; c.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             panel.animator().setFrame(to, display: true)
         }, completionHandler: { [weak self] in self?.lay() })
         if o {
-            // show the field now (not after the animation) so it can take typing straight away
-            mini.isHidden = true; visitors.isHidden = true; social.isHidden = true; todoBadge.isHidden = true; meter.isHidden = true; field.isHidden = false; status.isHidden = false
+            lay()
             NSApp.activate(ignoringOtherApps: true)   // otherwise typing keeps going to whatever app was in front (Terminal, after a send)
             panel.makeKeyAndOrderFront(nil)
             panel.makeFirstResponder(field)
@@ -1965,7 +2207,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             _ = p; dot.colors = mochiGoo
             fx.color = dot.colors.body
         }
-        mini.bobbing = !open && mini.stringValue == "Mochi" && !dot.sleeping
+        mini.bobbing = !open && mini.stringValue == "Eden" && !dot.sleeping
 
         // the meter: how long Claude has been at it, and how many tokens it has written this turn
         var prog: [String: Any] = [:]
@@ -2025,7 +2267,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             if text.range(of: #"\b(live|pushed|deployed|shipped|published)\b"#, options: [.regularExpression, .caseInsensitive]) != nil { dot.proud() } else { dot.hop() }
         }
         let body = (full?.count ?? 0) > text.count ? full! : text
-        bubbleProject.stringValue = "mochi · " + project
+        bubbleProject.stringValue = "Eden · " + project
         bubbleProject.sizeToFit()
         pages = paginate(body, width: 352 - 28, maxH: 88)
         if pages.count > 1 { pages = paginate(body, width: 392 - 68, maxH: 88) }   // narrower, to make room for the arrows
@@ -2148,21 +2390,32 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         if let t = todoPanel, t.isVisible { placeAbove(t, t.frame.size) }
     }
 
-    // Return sends, Esc clears and folds up
-    func control(_ c: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
-        if sel == #selector(NSResponder.insertNewline(_:)) { send(); return true }
-        if sel == #selector(NSResponder.cancelOperation(_:)) { field.stringValue = ""; setOpen(false); panel.resignKey(); lastApp?.activate(); return true }
+    // Return runs the command; Shift-Return inserts a line break. Escape closes the chat.
+    func textView(_ textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.insertNewline(_:)) {
+            if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
+                textView.insertText("\n", replacementRange: textView.selectedRange())
+            } else { send() }
+            return true
+        }
+        if sel == #selector(NSResponder.cancelOperation(_:)) {
+            if guidedMessage.isActive { cancelGuidedMessage() }
+            setOpen(false); panel.resignKey(); lastApp?.activate(); return true
+        }
         return false
     }
+
+    func textDidChange(_ notification: Notification) { field.needsDisplay = true }
 
     // a short note in whichever label is showing
     func flash(_ s: String, _ ok: Bool = true) {
         let c = ok ? NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9) : NSColor(red: 1, green: 0.55, blue: 0.55, alpha: 0.95)
         status.stringValue = s; status.textColor = c
         mini.stringValue = s; mini.textColor = c; mini.sizeToFit(); fitCollapsed(); lay(); mini.needsDisplay = true
+        if !open, bubble != nil { showBubble(s, project: "Eden", react: false) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             self.status.stringValue = self.destinationLabel(); self.status.textColor = NSColor(white: 1, alpha: 0.6)
-            self.mini.stringValue = "Mochi"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.fitCollapsed(); self.lay()
+            self.mini.stringValue = "Eden"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.fitCollapsed(); self.lay()
         }
     }
 
@@ -2462,8 +2715,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         alert.messageText = "Codex cannot resume this conversation now"
         let writerConflict = category.contains("writer") || category.contains("rollout path")
         alert.informativeText = writerConflict
-            ? "Another Codex process holds this conversation's writer. An idle status in Katescape's separate App Server does not release that ownership. Katescape did not send the draft. Continue in Codex; Katescape will not retry automatically."
-            : "App Server reports active work or another owner. Katescape did not send the draft. Its status checks cannot establish whether Codex Desktop owns a running turn. Continue in Codex; Katescape will not retry automatically."
+            ? "Another Codex process holds this conversation's writer. An idle status in Eden's separate App Server does not release that ownership. Eden did not send the draft. Continue in Codex; Eden will not retry automatically."
+            : "App Server reports active work or another owner. Eden did not send the draft. Its status checks cannot establish whether Codex Desktop owns a running turn. Continue in Codex; Eden will not retry automatically."
         alert.addButton(withTitle: "Open in Codex")
         alert.addButton(withTitle: "Keep draft")
         NSApp.activate(ignoringOtherApps: true)
@@ -2560,7 +2813,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
             client.respond(to: id, result: ["decision": "decline"])
         case "item/permissions/requestApproval":
             client.respond(to: id, result: ["permissions": [:], "scope": "turn"])
-        default: client.reject(to: id, message: "Katescape does not support this interactive request")
+        default: client.reject(to: id, message: "Eden does not support this interactive request")
         }
     }
 
@@ -2642,7 +2895,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
                 codexIsSelected(client, thread) && codexTurnID == activeID
             client.respond(to: id, result: ["permissions": approved ? requested : [:], "scope": "turn"])
         default:
-            client.reject(to: id, message: "Katescape cannot handle \(method); open Codex")
+            client.reject(to: id, message: "Eden cannot handle \(method); open Codex")
             flash("Codex needs an unsupported interaction; open Codex", false)
         }
         if codexTurnID == activeID, codexIsSelected(client, thread) {
@@ -2653,6 +2906,26 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     func send() {
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending, !launcherInProgress else { return }
+        if let destination = GuidedMessageIntentParser().parse(text) {
+            let previousDraft = guidedMessage.draft
+            guidedMessage.start(destination)
+            field.stringValue = previousDraft ?? ""
+            resetPlaceholder("Your message for \(destination.name)…")
+            showBubble(previousDraft == nil ? "What would you like to say?" :
+                "Switched to \(destination.name). Your draft is ready to edit or review.",
+                project: destination.name, react: false)
+            return
+        }
+        if guidedMessage.isActive {
+            if text.lowercased() == "cancel" || text.lowercased() == "never mind" {
+                cancelGuidedMessage()
+                showBubble("Okay, message cancelled.", project: "Eden", react: false)
+                return
+            }
+            guard guidedMessage.capture(field.stringValue) else { return }
+            confirmGuidedMessage()
+            return
+        }
         switch LauncherCommandParser().parse(text) {
         case .message: break
         case .browseCodexThreads:
@@ -2671,25 +2944,113 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         if answeringOther && provider == .claude { answer(nil, other: text); return }
         if handleTodo(text) { return }
         showBubble("I can open installed apps and show your Codex conversations. For CLI messages, use Advanced → Send Draft to Terminal.",
-                   project: "Katescape", react: false)
+                   project: "Eden", react: false)
+    }
+
+    private func cancelGuidedMessage() {
+        guidedMessage.cancel()
+        field.stringValue = ""
+        resetPlaceholder()
+    }
+
+    private func confirmGuidedMessage() {
+        guard case .confirming(let destination, let draft) = guidedMessage.state else { return }
+        let alert = NSAlert()
+        alert.messageText = "Message \(destination.name)"
+        let preview = draft.count > 280 ? String(draft.prefix(280)) + "…" : draft
+        alert.informativeText = "Copy this message and open \(destination.name)? Choose a conversation, then paste and send it yourself.\n\n\(preview)"
+        alert.addButton(withTitle: "Continue — Copy & Open")
+        alert.addButton(withTitle: "Edit")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: copyAndOpenGuidedMessage(destination, draft: draft)
+        case .alertSecondButtonReturn:
+            guidedMessage.edit()
+            field.stringValue = draft
+            showBubble("Edit your draft, then press Return to review it.", project: destination.name, react: false)
+            panel.makeKeyAndOrderFront(nil); panel.makeFirstResponder(field)
+        default:
+            cancelGuidedMessage()
+            showBubble("Okay, message cancelled.", project: "Eden", react: false)
+        }
+    }
+
+    private func copyAndOpenGuidedMessage(_ destination: GuidedMessageDestination, draft: String) {
+        let pasteboard = NSPasteboard.general
+        let previousItems = clipboardItems(pasteboard)
+        pasteboard.clearContents()
+        guard pasteboard.setString(draft, forType: .string) else {
+            restoreClipboard(pasteboard, items: previousItems, ifUnchanged: pasteboard.changeCount)
+            showBubble("Clipboard unavailable. Your draft is still here.", project: destination.name, react: false)
+            return
+        }
+        sending = true
+        let finish: (Bool, String) -> Void = { [weak self] opened, place in
+            guard let self else { return }
+            self.sending = false
+            if opened {
+                self.guidedMessage.cancel()
+                self.field.stringValue = ""
+                self.resetPlaceholder()
+                self.setOpen(false)
+                self.showBubble("Copied. \(place) Choose your conversation, then paste and send.",
+                                project: destination.name, react: false)
+            } else {
+                self.field.stringValue = draft
+                self.showBubble("I couldn't open \(destination.name) or its website. Your draft is still here.",
+                                project: destination.name, react: false)
+            }
+        }
+        let openWebsite: () -> Void = {
+            let opened = NSWorkspace.shared.open(destination.website)
+            finish(opened, opened ? "Opened \(destination.name) in your browser." : "")
+        }
+        guard let app = GuidedMessageAppResolver.verifiedApp(
+            for: destination, at: NSWorkspace.shared.urlForApplication(withBundleIdentifier: destination.bundleID)) else {
+            openWebsite(); return
+        }
+        if let running = NSWorkspace.shared.runningApplications.first(where: {
+            !$0.isTerminated && $0.bundleIdentifier == destination.bundleID &&
+                $0.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
+        }) {
+            if running.activate(options: [.activateAllWindows]) { finish(true, "Opened \(destination.name).") }
+            else { openWebsite() }
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { launched, error in
+            DispatchQueue.main.async {
+                let verified = error == nil && launched?.bundleIdentifier == destination.bundleID &&
+                    launched?.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
+                if verified { finish(true, "Opened \(destination.name).") }
+                else { openWebsite() }
+            }
+        }
     }
 
     // CLI messaging requires an explicit Advanced menu action. Return in the
     // universal field never falls through to provider sending.
     @objc private func sendAdvancedMessage() {
+        guard !guidedMessage.isActive else {
+            showBubble("Finish or cancel your guided message first. Nothing was sent.",
+                       project: "Eden", react: false)
+            return
+        }
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending, !launcherInProgress else {
-            if text.isEmpty { showBubble("Type a message first, then choose Advanced → Send Draft to Terminal.", project: "Katescape", react: false) }
+            if text.isEmpty { showBubble("Type a message first, then choose Advanced → Send Draft to Terminal.", project: "Eden", react: false) }
             return
         }
         guard provider != .codex || codexRoute == .terminal else {
             showBubble("Choose Codex CLI in Terminal under Advanced before sending. Your draft is still here.",
-                       project: "Katescape", react: false)
+                       project: "Eden", react: false)
             return
         }
         let confirmation = NSAlert()
         confirmation.messageText = "Send to \(provider.adapter.name) in Terminal?"
-        confirmation.informativeText = "Katescape will use an existing verified Terminal session. Your draft stays if you cancel."
+        confirmation.informativeText = "Eden will use an existing verified Terminal session. Your draft stays if you cancel."
         confirmation.addButton(withTitle: "Continue")
         confirmation.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
@@ -2697,8 +3058,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         guard AXIsProcessTrusted() else {
             let opt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
             _ = AXIsProcessTrustedWithOptions([opt: true] as CFDictionary)
-            showBubble("Allow Accessibility for Katescape, then retry Advanced sending. Your draft is still here.",
-                       project: "Katescape", react: false)
+            showBubble("Allow Accessibility for Eden, then retry Advanced sending. Your draft is still here.",
+                       project: "Eden", react: false)
             return
         }
         sendToSelectedTerminal(text)
@@ -2712,14 +3073,14 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         // when the executable is not visible from Mochi's PATH.
         let live = providerTTYs(selected)
         let tabs = terminalTTYs()
-        guard let availableTabs = tabs else { sendFailure("Cannot inspect Terminal tabs. Allow Automation for Mochi."); return }
+        guard let availableTabs = tabs else { sendFailure("Cannot inspect Terminal tabs. Allow Automation for Eden."); return }
         let candidates = live.intersection(availableTabs)
         if candidates.isEmpty {
             if executablePath(for: adapter) == nil { sendFailure("\(adapter.name) CLI not found"); return }
             sendFailure("No active \(adapter.name) session in Terminal; start one there first"); return
         }
         if selected == .codex {
-            guard executablePath(for: adapter) != nil else { sendFailure("Codex CLI executable unavailable to Katescape; draft kept"); return }
+            guard executablePath(for: adapter) != nil else { sendFailure("Codex CLI executable unavailable to Eden; draft kept"); return }
             guard codexAuthenticated() else { sendFailure("Codex sign-in unavailable; run codex login in Terminal"); return }
         }
         let front = run("""
@@ -2799,7 +3160,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         let alert = NSAlert()
         alert.messageText = approximate ? "Choose an app for \(name)" : "Several apps match \(name)"
         alert.informativeText = approximate
-            ? "No exact app matched. Choose explicitly; Katescape won't guess."
+            ? "No exact app matched. Choose explicitly; Eden won't guess."
             : "Choose which installed copy to open."
         alert.addButton(withTitle: "Open selected")
         alert.addButton(withTitle: "Skip")
@@ -2842,7 +3203,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     func chooseSession(_ ttys: [String], provider name: String) -> String? {
         let alert = NSAlert()
         alert.messageText = "Choose a \(name) Terminal session"
-        alert.informativeText = "Several sessions are running. Run tty in a tab if you need to identify it. Your draft stays in Mochi if you cancel."
+        alert.informativeText = "Several sessions are running. Run tty in a tab if you need to identify it. Your draft stays in Eden if you cancel."
         alert.addButton(withTitle: "Send to selected session")
         alert.addButton(withTitle: "Cancel")
         let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
@@ -2869,7 +3230,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         """).err
     }
 
-    func resetPlaceholder(_ s: String = "Ask Katescape to do something…") {
+    func resetPlaceholder(_ s: String = "Ask Eden to do something…") {
         field.placeholderAttributedString = NSAttributedString(string: s, attributes: [.foregroundColor: NSColor(white: 1, alpha: 0.62), .font: NSFont.systemFont(ofSize: 14)])
     }
 
@@ -2879,7 +3240,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
     func handleTodo(_ raw: String) -> Bool {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         s = s.replacingOccurrences(of: #"^(?i)(hey|hi|ok|okay)[,!]?\s+"#, with: "", options: .regularExpression)
-        s = s.replacingOccurrences(of: #"^(?i)mochi[,!:]?\s+"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"^(?i)(?:eden|mochi)[,!:]?\s+"#, with: "", options: .regularExpression)
         let T = #"(?:to-?\s?do|todo)"#
         func grab(_ pat: String) -> String? {
             guard let r = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]),
@@ -2944,13 +3305,13 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         box.subviews.forEach { $0.removeFromSuperview() }
         let W: CGFloat = 300, pad: CGFloat = 14, iw = W - 2 - pad * 2
         let openN = todos.filter { $0.done == nil }.count
-        var views: [NSView] = [label("mochi · to-do" + (openN > 0 ? "   \(openN) open" : ""), size: 10, weight: .medium, color: cyanText, mono: true)]
+        var views: [NSView] = [label("Eden · to-do" + (openN > 0 ? "   \(openN) open" : ""), size: 10, weight: .medium, color: cyanText, mono: true)]
         let close = Tap(frame: NSRect(x: 0, y: 0, width: 20, height: 18)); close.isBordered = false; close.target = self; close.action = #selector(closeTodoList)
         close.attributedTitle = NSAttributedString(string: "×", attributes: [.font: NSFont.systemFont(ofSize: 16), .foregroundColor: NSColor(white: 1, alpha: 0.55)])
         close.toolTip = "Close"
         let list = todos.sorted { ($0.done == nil ? 0 : 1, $0.added) < ($1.done == nil ? 0 : 1, $1.added) }
         if list.isEmpty {
-            views.append(label("All clear ✨  Tell Mochi “todo: …” to add something.", size: 12, color: NSColor(white: 1, alpha: 0.7), wrap: iw))
+            views.append(label("All clear ✨  Tell Eden “todo: …” to add something.", size: 12, color: NSColor(white: 1, alpha: 0.7), wrap: iw))
             // nothing left (and no badge to click): close on its own in a moment
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in if self?.todos.isEmpty == true { self?.hideTodoList() } }
         }
@@ -3033,11 +3394,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowD
         box.subviews.forEach { $0.removeFromSuperview() }
         let W: CGFloat = 360, pad: CGFloat = 14, iw = W - 2 - pad * 2
         var views: [NSView] = [
-            label("mochi · claude is asking" + (qs.count > 1 ? "   \(qIndex + 1) of \(qs.count)" : ""), size: 10, weight: .medium, color: cyanText, mono: true),
+            label("Eden · claude is asking" + (qs.count > 1 ? "   \(qIndex + 1) of \(qs.count)" : ""), size: 10, weight: .medium, color: cyanText, mono: true),
             label(q["question"] as? String ?? "", size: 13.5, weight: .semibold, wrap: iw)]
         if multi { views.append(label("This one takes several picks, so answer it in Terminal.", size: 11.5, color: NSColor(white: 1, alpha: 0.6), wrap: iw)) }
         for (i, o) in opts.enumerated() { views.append(option(o["label"] as? String ?? "", o["description"] as? String ?? "", width: iw, tag: i, enabled: !multi)) }
-        if !multi { views.append(option("Other…", "Type your own answer in Mochi", width: iw, tag: 1000, enabled: true)) }
+        if !multi { views.append(option("Other…", "Type your own answer in Eden", width: iw, tag: 1000, enabled: true)) }
         let go = Tap(frame: .zero); go.isBordered = false; go.target = self; go.action = #selector(openQuestionTab)
         go.attributedTitle = NSAttributedString(string: "Open in Terminal ↗", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: cyanText])
         go.sizeToFit(); views.append(go)
