@@ -106,14 +106,24 @@ check(LauncherCommandParser.isExplicitDesktopCommand("Open a file") &&
       !LauncherCommandParser.isExplicitDesktopCommand("Hello, Eden"),
       "only explicit desktop command wording requests confused feedback")
 
-func makeApp(in root: URL, file: String, display: String, bundleName: String, id: String) -> URL {
+func makeApp(in root: URL, file: String, display: String, bundleName: String, id: String,
+             flags: [String: Any] = [:], executable: Bool = true) -> URL {
     let app = root.appendingPathComponent(file + ".app", isDirectory: true)
     let contents = app.appendingPathComponent("Contents", isDirectory: true)
     try! FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
-    let info: [String: String] = ["CFBundleIdentifier": id, "CFBundlePackageType": "APPL",
-                                  "CFBundleName": bundleName, "CFBundleDisplayName": display]
+    var info: [String: Any] = ["CFBundleIdentifier": id, "CFBundlePackageType": "APPL",
+                               "CFBundleName": bundleName, "CFBundleDisplayName": display,
+                               "CFBundleExecutable": file]
+    flags.forEach { info[$0.key] = $0.value }
     let data = try! PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
     try! data.write(to: contents.appendingPathComponent("Info.plist"))
+    if executable {
+        let bin = contents.appendingPathComponent("MacOS", isDirectory: true)
+        try! FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let fileURL = bin.appendingPathComponent(file)
+        try! Data("fixture".utf8).write(to: fileURL)
+        try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fileURL.path)
+    }
     return app
 }
 
@@ -201,9 +211,22 @@ check(homeHeight - 31 - (homeHeading + 17) == 16 &&
       QuickChatLayout.input.minY == 16,
       "Quick Actions vertical spacing matches the compact layout")
 check(QuickChatLayout.height(for: .selecting(.copy), hasBadges: false) == 262 &&
-      QuickChatLayout.height(for: .selecting(.open), hasBadges: false) == 390 &&
+      QuickChatLayout.height(for: .selecting(.open), hasBadges: false) == 520 &&
       QuickChatLayout.height(for: .home, hasBadges: true) == 295,
       "guided actions and badges retain enough vertical space")
+check(QuickChatLayout.appRowHeight == 46 && QuickChatLayout.appRowGap == 6,
+      "application picker rows have a consistent compact size and gap")
+check(QuickChatLayout.gridColumns == 4 && QuickChatLayout.gridTileSize == NSSize(width: 67, height: 104) &&
+      QuickChatLayout.gridRows(for: 9) == 3, "Open picker uses four compact columns")
+let firstGridTile = QuickChatLayout.gridTileFrame(index: 0, firstTop: 400)
+let fourthGridTile = QuickChatLayout.gridTileFrame(index: 3, firstTop: 400)
+let fifthGridTile = QuickChatLayout.gridTileFrame(index: 4, firstTop: 400)
+check(firstGridTile.minX == 8 && fourthGridTile.maxX == 300 &&
+      fifthGridTile.minX == 8 && firstGridTile.minY - fifthGridTile.minY == 112,
+      "Open grid fits the chat width and spaces rows consistently")
+let longTileTitle = QuickAppTile.twoLineTitle("Adobe Photoshop Very Long Application Name")
+check(longTileTitle.split(separator: "\n").count == 2 && longTileTitle.hasSuffix("…"),
+      "long application labels use two word-aware lines and an ellipsis")
 let standard = scratch.appendingPathComponent("Applications")
 let outside = scratch.appendingPathComponent("Elsewhere")
 try! FileManager.default.createDirectory(at: standard, withIntermediateDirectories: true)
@@ -216,6 +239,42 @@ _ = makeApp(in: standard, file: "Photos", display: "Photos", bundleName: "Photos
 _ = makeApp(in: standard, file: "Visual Studio Code", display: "Visual Studio Code", bundleName: "Code", id: "com.microsoft.VSCode")
 _ = makeApp(in: standard, file: "Adobe Photoshop 2026", display: "Adobe Photoshop 2026", bundleName: "Adobe Photoshop 2026", id: "com.adobe.Photoshop.2026")
 let safariURL = makeApp(in: outside, file: "Safari", display: "Safari", bundleName: "Safari", id: "com.apple.Safari")
+let spotifyApp = InstalledApplication(url: spotifyURL)!
+let safariApp = InstalledApplication(url: safariURL)!
+let helperURL = makeApp(in: standard, file: "Sync Agent", display: "Sync Agent", bundleName: "Sync Agent",
+                        id: "example.sync", flags: ["LSUIElement": true])
+let missingBinaryURL = makeApp(in: standard, file: "Broken App", display: "Broken App", bundleName: "Broken App",
+                               id: "example.broken", executable: false)
+let helperApp = InstalledApplication(url: helperURL)!
+let missingBinaryApp = InstalledApplication(url: missingBinaryURL)!
+check(spotifyApp.isLaunchable && spotifyApp.isDefaultGridApp && !helperApp.isDefaultGridApp &&
+      !missingBinaryApp.isLaunchable, "Open filter uses executable and bundle metadata")
+check(InstalledApplication.isSystemUtilityPath("/System/Applications/Utilities/Terminal.app") &&
+      !InstalledApplication.isSystemUtilityPath("/System/Applications/Photos.app") &&
+      !InstalledApplication.isSystemUtilityPath(safariURL.path),
+      "system utilities are distinct from normal and outside-Applications apps")
+let gridRunning: [(app: InstalledApplication, pid: pid_t)] = [(spotifyApp, 101), (safariApp, 102)]
+let openGrid = QuickAppGridData.targets(for: .open,
+    installed: [spotifyApp, safariApp, helperApp, missingBinaryApp],
+    running: gridRunning, recentPIDs: [102], search: "")
+check(openGrid.count == 2 && openGrid.allSatisfy { $0.pid == nil } &&
+      openGrid.map { $0.app.displayName } == ["Safari", "Spotify"],
+      "Open grid uses the installed catalog and alphabetical order")
+let systemGrid = QuickAppGridData.targets(for: .open,
+    installed: [spotifyApp, helperApp, missingBinaryApp], running: [], recentPIDs: [], search: "",
+    showSystemApps: true)
+check(systemGrid.map { $0.app.displayName } == ["Spotify", "Sync Agent"],
+      "Show System Apps reveals launchable helpers but keeps broken bundles hidden")
+let switchGrid = QuickAppGridData.targets(for: .switchTo, installed: [spotifyApp, safariApp],
+    running: [(spotifyApp, 101)], recentPIDs: [101], search: "")
+check(switchGrid.count == 1 && switchGrid[0].app == spotifyApp && switchGrid[0].pid == 101,
+      "Switch grid uses running apps only and keeps the destination PID")
+check(QuickAppGridData.targets(for: .switchTo, installed: [], running: gridRunning,
+    recentPIDs: [102], search: "").map { $0.app.displayName } == ["Safari", "Spotify"],
+      "Switch grid uses observed activation order")
+check(QuickAppGridData.targets(for: .open, installed: [spotifyApp, safariApp], running: [],
+    recentPIDs: [], search: "spot").map { $0.app.displayName } == ["Spotify"],
+      "grid search filters the selected data source")
 
 let parser = LauncherCommandParser()
 let guidedParser = GuidedMessageIntentParser()
@@ -313,7 +372,7 @@ check(parser.parse("Open /Applications/Spotify.app") == .invalidAppReference, "p
 check(parser.parse("Open https://example.com") == .invalidAppReference, "URL rejected")
 
 let apps = LauncherAppDiscovery.catalog(roots: [standard], registeredURLs: [safariURL])
-check(apps.count == 7, "validated app bundle discovery")
+check(apps.count == 9, "validated app bundle discovery remains unchanged by the Open grid filter")
 check(LauncherAppResolver.resolve("Spotify", in: apps) == .exact(apps.filter { $0.bundleID == "com.spotify.client" }), "exact app name")
 check(LauncherAppResolver.resolve("com.apple.Photos", in: apps) == .exact(apps.filter { $0.bundleID == "com.apple.Photos" }), "bundle ID")
 check(LauncherAppResolver.resolve("VS Code", in: apps) == .alias(apps.filter { $0.bundleID == "com.microsoft.VSCode" }), "alias resolution")

@@ -58,6 +58,177 @@ final class PetHandle: NSView {
     }
 }
 
+final class QuickPickerRow: NSButton {
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let countLabel = NSTextField(labelWithString: "")
+    private let chevron = NSImageView()
+    private let showsChevron: Bool
+    private var hovered = false { didSet { updateBackground() } }
+
+    init(title: String, icon: NSImage?, showsChevron: Bool) {
+        self.showsChevron = showsChevron
+        super.init(frame: .zero)
+        self.title = ""
+        isBordered = false
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        toolTip = title
+        setAccessibilityLabel(title)
+        if let icon {
+            let iconView = NSImageView(image: icon)
+            iconView.frame = NSRect(x: 10, y: 10, width: 26, height: 26)
+            iconView.imageScaling = .scaleProportionallyUpOrDown
+            addSubview(iconView)
+        }
+        nameLabel.stringValue = title
+        nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.frame = NSRect(x: icon == nil ? 12 : 44, y: 13,
+                                 width: showsChevron ? 192 : 232, height: 20)
+        addSubview(nameLabel)
+        countLabel.font = .systemFont(ofSize: 11)
+        countLabel.textColor = .secondaryLabelColor
+        countLabel.alignment = .right
+        countLabel.frame = NSRect(x: 244, y: 14, width: 25, height: 18)
+        addSubview(countLabel)
+        chevron.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
+        chevron.contentTintColor = .secondaryLabelColor
+        chevron.frame = NSRect(x: 274, y: 17, width: 10, height: 12)
+        chevron.isHidden = !showsChevron
+        addSubview(chevron)
+        updateBackground()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func showWindowCount(_ count: Int) {
+        countLabel.stringValue = count > 1 ? "\(count)" : ""
+        chevron.isHidden = count <= 1 || !showsChevron
+        nameLabel.frame.size.width = count > 1 ? 192 : 232
+    }
+
+    private func updateBackground() {
+        layer?.backgroundColor = NSColor(white: 1, alpha: hovered ? 0.16 : 0.06).cgColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+}
+
+final class QuickAppTile: NSButton {
+    var onNavigate: ((Int) -> Void)?
+    private var hovered = false { didSet { updateAppearance() } }
+    private let windowCount = NSTextField(labelWithString: "")
+
+    init(title: String, icon: NSImage) {
+        super.init(frame: .zero)
+        self.title = ""
+        isBordered = false
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        toolTip = title
+        setAccessibilityLabel(title)
+        let image = NSImageView(image: icon)
+        image.frame = NSRect(x: 8.5, y: 6, width: 50, height: 50)
+        image.imageScaling = .scaleProportionallyUpOrDown
+        addSubview(image)
+        windowCount.font = .systemFont(ofSize: 10, weight: .semibold)
+        windowCount.alignment = .center
+        windowCount.textColor = .white
+        windowCount.wantsLayer = true
+        windowCount.layer?.cornerRadius = 8
+        windowCount.layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.85).cgColor
+        windowCount.frame = NSRect(x: 45, y: 6, width: 19, height: 16)
+        windowCount.isHidden = true
+        addSubview(windowCount)
+        let label = NSTextField(labelWithString: Self.twoLineTitle(title))
+        label.font = .systemFont(ofSize: 10.5)
+        label.alignment = .center
+        label.usesSingleLineMode = false
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 2
+        label.cell?.wraps = true
+        label.cell?.truncatesLastVisibleLine = true
+        label.frame = NSRect(x: 2, y: 63, width: 63, height: 33)
+        addSubview(label)
+        updateAppearance()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var isFlipped: Bool { true }
+
+    static func twoLineTitle(_ title: String) -> String {
+        let font = NSFont.systemFont(ofSize: 10.5)
+        func fits(_ text: String) -> Bool {
+            (text as NSString).size(withAttributes: [.font: font]).width <= 63
+        }
+        func shortened(_ text: String) -> String {
+            var result = text
+            while !result.isEmpty && !fits(result + "…") { result.removeLast() }
+            return result + "…"
+        }
+        let words = title.split(whereSeparator: \.isWhitespace).map(String.init)
+        var lines = [String]()
+        for word in words {
+            if lines.isEmpty { lines = [fits(word) ? word : shortened(word)]; continue }
+            let joined = lines[lines.count - 1] + " " + word
+            if fits(joined) { lines[lines.count - 1] = joined; continue }
+            if lines.count == 1 { lines.append(fits(word) ? word : shortened(word)); continue }
+            lines[1] = shortened(lines[1])
+            return lines.joined(separator: "\n")
+        }
+        return lines.joined(separator: "\n")
+    }
+    func showWindowCount(_ count: Int) {
+        windowCount.stringValue = count > 1 ? "\(count)" : ""
+        windowCount.isHidden = count <= 1
+        setAccessibilityLabel(count > 1 ? "\(toolTip ?? "Application"), \(count) windows" : (toolTip ?? "Application"))
+    }
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        updateAppearance()
+        return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        updateAppearance()
+        return resigned
+    }
+    private func updateAppearance() {
+        let focused = window?.firstResponder === self
+        layer?.backgroundColor = NSColor(white: 1, alpha: hovered || focused ? 0.17 : 0.04).cgColor
+        layer?.borderWidth = focused ? 2 : 0
+        layer?.borderColor = NSColor.controlAccentColor.cgColor
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 123: onNavigate?(-1)
+        case 124: onNavigate?(1)
+        case 125: onNavigate?(4)
+        case 126: onNavigate?(-4)
+        case 36, 49, 76: performClick(self)
+        default: super.keyDown(with: event)
+        }
+    }
+}
+
 enum PetChatLayout {
     static func spawnFrame(size: NSSize, primaryVisible: NSRect, savedOrigin: NSPoint?,
                            visibleFrames: [NSRect]) -> NSRect {
@@ -283,6 +454,19 @@ struct QuickActionFlow {
 }
 
 enum QuickChatLayout {
+    static let gridColumns = 4
+    static let gridTileSize = NSSize(width: 67, height: 104)
+    static let gridColumnGap: CGFloat = 8
+    static let gridRowGap: CGFloat = 8
+    static func gridRows(for count: Int) -> Int { (count + gridColumns - 1) / gridColumns }
+    static func gridTileFrame(index: Int, firstTop: CGFloat) -> NSRect {
+        let column = index % gridColumns, row = index / gridColumns
+        return NSRect(x: 8 + CGFloat(column) * (gridTileSize.width + gridColumnGap),
+                      y: firstTop - gridTileSize.height - CGFloat(row) * (gridTileSize.height + gridRowGap),
+                      width: gridTileSize.width, height: gridTileSize.height)
+    }
+    static let appRowHeight: CGFloat = 46
+    static let appRowGap: CGFloat = 6
     static let input = NSRect(x: 12, y: 16, width: 316, height: 67)
     static let inputText = NSRect(x: 19, y: 22, width: 302, height: 55)
     static let buttonSize = NSSize(width: 98, height: 46)
@@ -293,7 +477,8 @@ enum QuickChatLayout {
         let base: CGFloat
         switch state {
         case .home: base = 275
-        case .selecting(.open), .selecting(.switchTo), .selecting(.hide), .selecting(.quit), .selectingWindow: base = 390
+        case .selecting(.open), .selecting(.switchTo), .selecting(.hide), .selecting(.quit): base = 520
+        case .selectingWindow: base = 390
         case .selecting(.copy), .selecting(.message): base = 262
         }
         return base + (hasBadges ? 20 : 0)
@@ -449,6 +634,11 @@ struct LauncherCommandParser {
 }
 
 struct InstalledApplication: Hashable {
+    static func isSystemUtilityPath(_ path: String) -> Bool {
+        ["/System/Library/", "/Library/", "/Applications/Utilities/",
+         "/System/Applications/Utilities/"].contains { path.hasPrefix($0) }
+    }
+
     let url: URL
     let displayName: String
     let bundleName: String
@@ -471,6 +661,53 @@ struct InstalledApplication: Hashable {
     }
 
     var names: [String] { [displayName, bundleName, fileName] }
+
+    var isLaunchable: Bool {
+        guard let executable = Bundle(url: url)?.executableURL else { return false }
+        return FileManager.default.isExecutableFile(atPath: executable.path)
+    }
+
+    var isDefaultGridApp: Bool {
+        guard isLaunchable, let info = Bundle(url: url)?.infoDictionary else { return false }
+        func flag(_ key: String) -> Bool {
+            if let number = info[key] as? NSNumber { return number.boolValue }
+            if let text = info[key] as? String { return ["1", "true", "yes"].contains(text.lowercased()) }
+            return false
+        }
+        if flag("LSUIElement") || flag("LSBackgroundOnly") { return false }
+        let parent = url.deletingLastPathComponent().path
+        if parent.split(separator: "/").contains(where: { $0.hasSuffix(".app") }) { return false }
+        return !Self.isSystemUtilityPath(url.path)
+    }
+}
+
+enum QuickAppGridData {
+    typealias Target = (app: InstalledApplication, pid: pid_t?)
+
+    static func targets(for action: QuickActionFlow.Action, installed: [InstalledApplication],
+                        running: [(app: InstalledApplication, pid: pid_t)],
+                        recentPIDs: [pid_t], search: String, showSystemApps: Bool = false) -> [Target] {
+        let key = LauncherAppResolver.normalized(search)
+        let candidates: [Target] = action == .open
+            ? installed.filter { $0.isLaunchable && (showSystemApps || $0.isDefaultGridApp) }
+                .map { (app: $0, pid: nil) }
+            : running.map { (app: $0.app, pid: $0.pid) }
+        return candidates.filter { key.isEmpty ||
+            LauncherAppResolver.normalized($0.app.displayName).contains(key) ||
+            LauncherAppResolver.normalized($0.app.bundleID).contains(key)
+        }.sorted {
+            if action == .switchTo {
+                let left = $0.pid.flatMap { recentPIDs.firstIndex(of: $0) }
+                let right = $1.pid.flatMap { recentPIDs.firstIndex(of: $0) }
+                if left != right { return (left ?? Int.max) < (right ?? Int.max) }
+            }
+            let order = $0.app.displayName.localizedStandardCompare($1.app.displayName)
+            if order != .orderedSame { return order == .orderedAscending }
+            if $0.app.bundleID != $1.app.bundleID { return $0.app.bundleID < $1.app.bundleID }
+            if $0.app.url != $1.app.url { return $0.app.url.path < $1.app.url.path }
+            return ($0.pid ?? 0) < ($1.pid ?? 0)
+        }
+    }
 }
 
 struct GuidedMessageAppResolver {
@@ -1760,17 +1997,29 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     private var quickFolders: [DesktopFolder] = []
     private var quickLoading = false
     private var quickRows: [NSView] = []
+    private var quickGridTiles: [QuickAppTile] = []
+    private var quickIconCache: [URL: NSImage] = [:]
     private var quickSectionLabel: NSTextField!
     private var quickBackButton: NSButton!
     private var quickCancelButton: NSButton!
     private var quickScroll: NSScrollView!
     private var quickContent: NSView!
     private var quickSearch: NSSearchField!
+    private var quickFolderPopup: NSPopUpButton!
+    private var quickSystemToggle: NSButton!
+    private var showSystemApps = false
     private var quickCopyField: NSTextField!
     private var quickCopyButton: NSButton!
     private var quickMessageButtons: [NSButton] = []
     private var quickActionButtons: [NSButton] = []
     private var quickSavedDraft: String?
+    private var recentAppPIDs: [pid_t] = []
+    private let quickCountQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+    private var quickCountGeneration = 0
     var lastApp: NSRunningApplication?
     var open = false
 
@@ -1807,9 +2056,17 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         }
         // remember the last app you were in (that isn't this bar), to hand focus back after sending
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
-            if let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, a.bundleIdentifier != Bundle.main.bundleIdentifier { self?.lastApp = a }
+            if let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+               a.bundleIdentifier != Bundle.main.bundleIdentifier {
+                self?.lastApp = a
+                self?.recentAppPIDs.removeAll { $0 == a.processIdentifier }
+                self?.recentAppPIDs.insert(a.processIdentifier, at: 0)
+            }
         }
         lastApp = NSWorkspace.shared.frontmostApplication
+        if let lastApp, lastApp.bundleIdentifier != Bundle.main.bundleIdentifier {
+            recentAppPIDs = [lastApp.processIdentifier]
+        }
 
         // A saved drag position wins while its centre remains on a connected display.
         let screens = NSScreen.screens
@@ -1967,6 +2224,16 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickSearch = NSSearchField(frame: .zero)
         quickSearch.placeholderString = "Search installed apps"
         quickSearch.delegate = self
+        quickFolderPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        quickFolderPopup.target = self
+        quickFolderPopup.action = #selector(chooseQuickFolderFromPopup(_:))
+        quickFolderPopup.isHidden = true
+        glass.addSubview(quickFolderPopup)
+        quickSystemToggle = NSButton(checkboxWithTitle: "Show System Apps", target: self,
+                                     action: #selector(toggleQuickSystemApps(_:)))
+        quickSystemToggle.font = .systemFont(ofSize: 10)
+        quickSystemToggle.isHidden = true
+        glass.addSubview(quickSystemToggle)
         quickCopyField = NSTextField(frame: .zero)
         quickCopyField.placeholderString = "Text to copy"
         quickCopyField.target = self
@@ -2648,7 +2915,23 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickCancelButton.frame = NSRect(x: W - 84, y: headingY - 3, width: 69, height: 22)
         quickBackButton.isHidden = quickFlow.state == .home
         quickCancelButton.isHidden = quickFlow.state == .home
-        quickScroll.frame = QuickChatLayout.scrollFrame(height: H, hasBadges: hasChatBadges)
+        layoutQuickPicker(height: H)
+    }
+
+    private func layoutQuickPicker(height: CGFloat) {
+        let area = QuickChatLayout.scrollFrame(height: height, hasBadges: hasChatBadges)
+        guard case .selecting(let action) = quickFlow.state,
+              action == .open || action == .switchTo else {
+            quickScroll.frame = area
+            return
+        }
+        quickSearch.frame = NSRect(x: 16, y: area.maxY - 28, width: 308, height: 26)
+        let controlsY = quickSearch.frame.minY - 34
+        quickFolderPopup.frame = NSRect(x: 16, y: controlsY, width: 137, height: 26)
+        quickSystemToggle.frame = NSRect(x: 164, y: controlsY, width: 160, height: 26)
+        let gridTop = action == .open ? controlsY - 8 : quickSearch.frame.minY - 8
+        quickScroll.frame = NSRect(x: area.minX, y: area.minY, width: area.width,
+                                   height: max(36, gridTop - area.minY))
     }
 
     private func catClicked() {
@@ -2674,6 +2957,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     private func renderQuickActions() {
         quickContent.subviews.forEach { $0.removeFromSuperview() }
+        quickSearch.removeFromSuperview()
+        quickFolderPopup.isHidden = true
+        quickSystemToggle.isHidden = true
         quickRows = []
         switch quickFlow.state {
         case .home:
@@ -2703,8 +2989,14 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                     quickContent.addSubview(button)
                 }
             case .open, .switchTo, .hide, .quit:
-                quickSearch.placeholderString = action == .open ? "Search installed apps or folders" : "Search running apps"
-                quickContent.addSubview(quickSearch)
+                quickSearch.placeholderString = action == .open ? "Search installed apps" : "Search running apps"
+                if action == .open || action == .switchTo {
+                    chatGlass.addSubview(quickSearch)
+                    quickFolderPopup.isHidden = action != .open
+                    quickSystemToggle.isHidden = action != .open
+                } else {
+                    quickContent.addSubview(quickSearch)
+                }
                 renderQuickList()
             }
         case .selectingWindow:
@@ -2717,27 +3009,33 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     private func renderQuickList() {
         guard case .selecting(let action) = quickFlow.state, action.appAction != nil else { return }
+        if action == .open || action == .switchTo { renderQuickAppGrid(for: action); return }
+        quickCountQueue.cancelAllOperations()
+        quickCountGeneration += 1
+        let countGeneration = quickCountGeneration
         quickRows.forEach { $0.removeFromSuperview() }
         quickRows = []
         let search = LauncherAppResolver.normalized(quickSearch.stringValue)
         let matches: (String) -> Bool = { search.isEmpty || LauncherAppResolver.normalized($0).contains(search) }
-        quickFolders = action == .open ? DesktopFolder.allQuickCases.filter { matches($0.title) } : []
-        let candidates: [(app: InstalledApplication, pid: pid_t?)]
-        if action == .open {
-            candidates = quickCatalog.map { ($0, nil) }
-        } else {
-            candidates = NSWorkspace.shared.runningApplications.compactMap { running in
-                guard !running.isTerminated, running.activationPolicy == .regular,
-                      running.processIdentifier != ProcessInfo.processInfo.processIdentifier,
-                      let url = running.bundleURL, let app = InstalledApplication(url: url) else { return nil }
-                return (app, running.processIdentifier)
-            }
+        quickFolders = []
+        let candidates: [(app: InstalledApplication, pid: pid_t?)] = NSWorkspace.shared.runningApplications.compactMap { running in
+            guard !running.isTerminated, running.activationPolicy == .regular,
+                  running.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                  let url = running.bundleURL, let app = InstalledApplication(url: url) else { return nil }
+            return (app, running.processIdentifier)
         }
         let filtered = candidates.filter { matches($0.app.displayName) || matches($0.app.bundleID) }
-            .sorted { $0.app.displayName.localizedStandardCompare($1.app.displayName) == .orderedAscending }
+            .sorted {
+                let left = $0.pid.flatMap { recentAppPIDs.firstIndex(of: $0) }
+                let right = $1.pid.flatMap { recentAppPIDs.firstIndex(of: $0) }
+                if left != right { return (left ?? Int.max) < (right ?? Int.max) }
+                return $0.app.displayName.localizedStandardCompare($1.app.displayName) == .orderedAscending
+            }
         quickTargets = Array(filtered.prefix(100))
         let count = quickFolders.count + quickTargets.count
-        let contentHeight = max(quickScroll.contentSize.height, CGFloat(count) * 34 + (filtered.count > 100 ? 70 : 44))
+        let rowStep = QuickChatLayout.appRowHeight + QuickChatLayout.appRowGap
+        let contentHeight = max(quickScroll.contentSize.height,
+                                CGFloat(count) * rowStep + (filtered.count > 100 ? 78 : 54))
         quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: contentHeight)
         quickSearch.frame = NSRect(x: 0, y: contentHeight - 30, width: W - 48, height: 26)
         if count == 0 {
@@ -2746,32 +3044,127 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             label.frame = NSRect(x: 4, y: contentHeight - 67, width: W - 48, height: 20)
             quickContent.addSubview(label); quickRows.append(label)
         }
-        for (index, folder) in quickFolders.enumerated() {
-            let button = NSButton(title: folder.title, target: self, action: #selector(chooseQuickFolder(_:)))
-            button.tag = index
-            button.image = NSImage(systemSymbolName: "folder", accessibilityDescription: folder.title)
-            styleQuickRow(button, y: contentHeight - 68 - CGFloat(index) * 34)
-        }
         for (index, target) in quickTargets.enumerated() {
             let duplicate = quickTargets.contains {
                 $0.app.url != target.app.url && $0.app.displayName == target.app.displayName
             }
-            let location = duplicate ? " · \(target.app.url.deletingLastPathComponent().path)" : ""
+            let copyNumber = quickTargets[...index].filter { $0.app.displayName == target.app.displayName && $0.app.url == target.app.url }.count
             let sameCopy = quickTargets.filter { $0.app.url == target.app.url && $0.app.displayName == target.app.displayName }
-            let instance = sameCopy.count > 1
-                ? " · Instance \(quickTargets[...index].filter { $0.app.url == target.app.url && $0.app.displayName == target.app.displayName }.count)" : ""
-            let suffix = location + instance
-            let button = NSButton(title: target.app.displayName + suffix, target: self, action: #selector(chooseQuickApp(_:)))
+            let suffix = sameCopy.count > 1 ? " · Instance \(copyNumber)" : (duplicate ? " · \(target.app.bundleID)" : "")
+            let button = QuickPickerRow(title: target.app.displayName + suffix,
+                icon: NSWorkspace.shared.icon(forFile: target.app.url.path), showsChevron: action == .switchTo)
             button.tag = index
-            button.image = NSWorkspace.shared.icon(forFile: target.app.url.path)
-            button.toolTip = "\(target.app.bundleID)\n\(target.app.url.path)"
-            styleQuickRow(button, y: contentHeight - 68 - CGFloat(quickFolders.count + index) * 34)
+            button.target = self; button.action = #selector(chooseQuickApp(_:))
+            button.frame = NSRect(x: 0, y: contentHeight - 88 - CGFloat(quickFolders.count + index) * rowStep,
+                                  width: W - 48, height: QuickChatLayout.appRowHeight)
+            quickContent.addSubview(button); quickRows.append(button)
+            let pid = target.pid ?? NSWorkspace.shared.runningApplications.first {
+                !$0.isTerminated && $0.bundleURL == target.app.url
+            }?.processIdentifier
+            if let pid, AXIsProcessTrustedWithOptions(nil) {
+                quickCountQueue.addOperation { [weak self, weak button] in
+                    let count: Int
+                    switch QuickWindowSwitcher.windows(for: pid) {
+                    case .available(let windows): count = windows.count
+                    case .unavailable: count = 0
+                    }
+                    DispatchQueue.main.async {
+                        guard let self, self.quickCountGeneration == countGeneration,
+                              let button, button.superview === self.quickContent else { return }
+                        button.showWindowCount(count)
+                    }
+                }
+            }
         }
         if filtered.count > 100 {
             let label = NSTextField(labelWithString: "Showing 100 apps. Search to narrow the list.")
             label.textColor = NSColor(white: 1, alpha: 0.7)
             label.frame = NSRect(x: 4, y: 5, width: W - 48, height: 20)
             quickContent.addSubview(label); quickRows.append(label)
+        }
+        quickContent.scroll(NSPoint(x: 0, y: max(0, contentHeight - quickScroll.contentSize.height)))
+        chatPanel.recalculateKeyViewLoop()
+    }
+
+    private func renderQuickAppGrid(for action: QuickActionFlow.Action) {
+        quickCountQueue.cancelAllOperations()
+        quickCountGeneration += 1
+        let countGeneration = quickCountGeneration
+        quickRows.forEach { $0.removeFromSuperview() }
+        quickRows = []
+        quickGridTiles = []
+        quickFolders = action == .open ? DesktopFolder.allQuickCases : []
+        if action == .open {
+            quickFolderPopup.removeAllItems()
+            quickFolderPopup.addItem(withTitle: "Folders")
+            quickFolders.forEach { quickFolderPopup.addItem(withTitle: $0.title) }
+            quickFolderPopup.selectItem(at: 0)
+        }
+        let running: [(app: InstalledApplication, pid: pid_t)] = action == .open ? [] :
+            NSWorkspace.shared.runningApplications.compactMap { application in
+                guard !application.isTerminated, application.activationPolicy == .regular,
+                      application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                      let url = application.bundleURL, let app = InstalledApplication(url: url) else { return nil }
+                return (app: app, pid: application.processIdentifier)
+            }
+        quickTargets = QuickAppGridData.targets(for: action, installed: quickCatalog,
+            running: running, recentPIDs: recentAppPIDs, search: quickSearch.stringValue,
+            showSystemApps: showSystemApps)
+        let appRows = QuickChatLayout.gridRows(for: quickTargets.count)
+        let rowStep = QuickChatLayout.gridTileSize.height + QuickChatLayout.gridRowGap
+        let contentHeight = max(quickScroll.contentSize.height,
+                                CGFloat(appRows) * rowStep + 8)
+        quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: contentHeight)
+        if quickTargets.isEmpty {
+            let message = quickLoading && action == .open ? "Finding apps…" :
+                (action == .open ? "No matching applications" : "No matching running apps")
+            let label = NSTextField(labelWithString: message)
+            label.textColor = NSColor(white: 1, alpha: 0.7)
+            label.frame = NSRect(x: 8, y: contentHeight - 28, width: 280, height: 20)
+            quickContent.addSubview(label); quickRows.append(label)
+        }
+        let nameCounts = Dictionary(quickTargets.map { ($0.app.displayName, 1) }, uniquingKeysWith: +)
+        var nameOrdinals: [String: Int] = [:]
+        for (index, target) in quickTargets.enumerated() {
+            let icon: NSImage
+            if let cached = quickIconCache[target.app.url] {
+                icon = cached
+            } else {
+                let candidate = NSWorkspace.shared.icon(forFile: target.app.url.path)
+                icon = candidate.isValid ? candidate :
+                    (NSImage(systemSymbolName: "app", accessibilityDescription: nil) ?? NSImage(size: NSSize(width: 48, height: 48)))
+                quickIconCache[target.app.url] = icon
+            }
+            nameOrdinals[target.app.displayName, default: 0] += 1
+            let title = target.app.displayName + (nameCounts[target.app.displayName, default: 0] > 1
+                ? " · \(nameOrdinals[target.app.displayName, default: 0])" : "")
+            let tile = QuickAppTile(title: title, icon: icon)
+            tile.tag = index
+            tile.target = self; tile.action = #selector(chooseQuickApp(_:))
+            tile.frame = QuickChatLayout.gridTileFrame(index: index, firstTop: contentHeight - 8)
+            tile.onNavigate = { [weak self] delta in
+                guard let self, self.quickGridTiles.indices.contains(index + delta) else { return }
+                let next = self.quickGridTiles[index + delta]
+                self.chatPanel.makeFirstResponder(next)
+                self.quickContent.scrollToVisible(next.frame)
+            }
+            quickContent.addSubview(tile)
+            quickRows.append(tile)
+            quickGridTiles.append(tile)
+            if action == .switchTo, let pid = target.pid, AXIsProcessTrustedWithOptions(nil) {
+                quickCountQueue.addOperation { [weak self, weak tile] in
+                    let count: Int
+                    switch QuickWindowSwitcher.windows(for: pid) {
+                    case .available(let windows): count = windows.count
+                    case .unavailable: count = 0
+                    }
+                    DispatchQueue.main.async {
+                        guard let self, self.quickCountGeneration == countGeneration,
+                              let tile, tile.superview === self.quickContent else { return }
+                        tile.showWindowCount(count)
+                    }
+                }
+            }
         }
         quickContent.scroll(NSPoint(x: 0, y: max(0, contentHeight - quickScroll.contentSize.height)))
         chatPanel.recalculateKeyViewLoop()
@@ -2848,7 +3241,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickFlow.begin(action)
         quickSearch.stringValue = ""
         quickSwitchTarget = nil; quickWindowTargets = []; quickWindowFallback = nil; quickAppSearch = ""
-        if action == .open { quickCatalog = [] }
+        if action == .open {
+            quickCatalog = []; quickIconCache.removeAll()
+            showSystemApps = false; quickSystemToggle.state = .off
+        }
         quickLoading = action == .open
         refreshQuickActions()
         if action == .open {
@@ -2884,9 +3280,16 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         showBubble("Okay, cancelled. Your draft is still here.", project: "Eden", react: false)
     }
 
-    @objc private func chooseQuickFolder(_ sender: NSButton) {
-        guard quickFolders.indices.contains(sender.tag) else { return }
-        let folder = quickFolders[sender.tag]
+    @objc private func toggleQuickSystemApps(_ sender: NSButton) {
+        guard quickFlow.state == .selecting(.open) else { return }
+        showSystemApps = sender.state == .on
+        renderQuickAppGrid(for: .open)
+    }
+
+    @objc private func chooseQuickFolderFromPopup(_ sender: NSPopUpButton) {
+        guard quickFlow.state == .selecting(.open),
+              quickFolders.indices.contains(sender.indexOfSelectedItem - 1) else { return }
+        let folder = quickFolders[sender.indexOfSelectedItem - 1]
         let draft = field.stringValue
         openDesktopFolder(folder, draft: draft, preserveDraft: true)
         quickFlow.back(); refreshQuickActions()
