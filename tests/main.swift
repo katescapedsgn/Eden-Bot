@@ -121,6 +121,25 @@ let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("ede
 let screen = NSRect(x: 0, y: 0, width: 800, height: 600)
 let petFrame = NSRect(x: 100, y: 20, width: 96, height: 96)
 let chatSize = NSSize(width: 340, height: 168)
+let defaultPet = PetChatLayout.spawnFrame(size: petFrame.size, primaryVisible: screen,
+    savedOrigin: nil, visibleFrames: [screen])
+check(defaultPet == NSRect(x: 684, y: 20, width: 96, height: 96),
+      "default pet is 20 points from the primary display's visible right and bottom edges")
+check(PetChatLayout.chatFrame(pet: defaultPet, size: chatSize, visible: screen).maxX == defaultPet.minX - 8,
+      "default chat opens to the left without moving the pet")
+check(PetChatLayout.spawnFrame(size: petFrame.size, primaryVisible: screen,
+    savedOrigin: petFrame.origin, visibleFrames: [screen]) == petFrame,
+      "saved pet position is restored")
+check(PetChatLayout.spawnFrame(size: petFrame.size, primaryVisible: screen,
+    savedOrigin: NSPoint(x: 900, y: 0), visibleFrames: [screen]) == defaultPet,
+      "saved position on a disconnected display uses the primary default")
+check(PetChatLayout.spawnFrame(size: petFrame.size, primaryVisible: screen,
+    savedOrigin: NSPoint(x: CGFloat.nan, y: 0), visibleFrames: [screen]) == defaultPet,
+      "invalid saved coordinates use the primary default")
+let dockVisible = NSRect(x: 12, y: 64, width: 760, height: 500)
+check(PetChatLayout.spawnFrame(size: petFrame.size, primaryVisible: dockVisible,
+    savedOrigin: nil, visibleFrames: [dockVisible]) == NSRect(x: 656, y: 84, width: 96, height: 96),
+      "default spawn respects an offset visible frame for Dock and menu bar")
 let chatFrame = PetChatLayout.chatFrame(pet: petFrame, size: chatSize, visible: screen)
 check(chatFrame.width == 340 && chatFrame.height == 168, "compact chat dimensions")
 check(chatFrame.minX == petFrame.maxX + 8 && chatFrame.minY == petFrame.minY,
@@ -152,6 +171,9 @@ check(PetChatLayout.chatFrame(pet: NSRect(x: 160, y: 450, width: 96, height: 96)
       "chat moves below the pet when above does not fit")
 let secondScreen = NSRect(x: 800, y: -200, width: 1200, height: 900)
 let secondPet = NSRect(x: 950, y: -180, width: 96, height: 96)
+check(PetChatLayout.spawnFrame(size: petFrame.size, primaryVisible: screen,
+    savedOrigin: secondPet.origin, visibleFrames: [screen, secondScreen]) == secondPet,
+      "saved position on another connected display is restored")
 let secondChat = PetChatLayout.chatFrame(pet: secondPet, size: chatSize, visible: secondScreen)
 check(secondChat.minX >= secondScreen.minX + 8 && secondChat.maxX <= secondScreen.maxX - 8 &&
       secondChat.minY >= secondScreen.minY + 8 && secondChat.maxY <= secondScreen.maxY - 8,
@@ -234,6 +256,20 @@ for action in QuickActionFlow.Action.allCases {
 }
 check(QuickActionFlow.Action.open.appAction != nil && QuickActionFlow.Action.copy.appAction == nil,
       "quick actions separate app and non-app operations")
+quick.begin(.switchTo)
+quick.selectWindow()
+check(quick.state == .selectingWindow, "Switch can advance to window selection")
+quick.back()
+check(quick.state == .selecting(.switchTo), "Back from windows returns to running apps")
+quick.selectWindow()
+quick.cancel()
+check(quick.state == .home, "Cancel from windows returns home")
+quick.begin(.open)
+quick.selectWindow()
+check(quick.state == .selecting(.open), "other Quick Actions cannot enter window selection")
+check(QuickWindowSwitcher.label("", index: 1, minimized: false) == "Untitled window 2" &&
+      QuickWindowSwitcher.label("  Report  ", index: 0, minimized: true) == "Report · Minimized",
+      "window labels handle untitled and minimised windows without PIDs")
 check(parser.parse("Open Photoshop") == .open(["Photoshop"]), "open parser")
 check(parser.parse("Launch Godot") == .open(["Godot"]), "launch parser")
 check(parser.parse("Open Spotify and Discord") == .open(["Spotify", "Discord"]), "multiple apps")

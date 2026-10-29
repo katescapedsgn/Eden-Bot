@@ -59,6 +59,19 @@ final class PetHandle: NSView {
 }
 
 enum PetChatLayout {
+    static func spawnFrame(size: NSSize, primaryVisible: NSRect, savedOrigin: NSPoint?,
+                           visibleFrames: [NSRect]) -> NSRect {
+        if let savedOrigin, savedOrigin.x.isFinite, savedOrigin.y.isFinite {
+            let saved = NSRect(origin: savedOrigin, size: size)
+            if let screen = visibleFrames.first(where: { $0.contains(NSPoint(x: saved.midX, y: saved.midY)) }) {
+                return petFrame(saved, visible: screen)
+            }
+        }
+        return petFrame(NSRect(x: primaryVisible.maxX - size.width - 20,
+                               y: primaryVisible.minY + 20, width: size.width, height: size.height),
+                        visible: primaryVisible)
+    }
+
     static func petFrame(_ frame: NSRect, visible: NSRect?) -> NSRect {
         guard let visible else { return frame }
         var result = frame
@@ -259,10 +272,13 @@ struct QuickActionFlow {
         }
     }
 
-    enum State: Equatable { case home, selecting(Action) }
+    enum State: Equatable { case home, selecting(Action), selectingWindow }
     private(set) var state: State = .home
     mutating func begin(_ action: Action) { state = .selecting(action) }
-    mutating func back() { state = .home }
+    mutating func selectWindow() {
+        if state == .selecting(.switchTo) { state = .selectingWindow }
+    }
+    mutating func back() { state = state == .selectingWindow ? .selecting(.switchTo) : .home }
     mutating func cancel() { state = .home }
 }
 
@@ -277,7 +293,7 @@ enum QuickChatLayout {
         let base: CGFloat
         switch state {
         case .home: base = 275
-        case .selecting(.open), .selecting(.switchTo), .selecting(.hide), .selecting(.quit): base = 390
+        case .selecting(.open), .selecting(.switchTo), .selecting(.hide), .selecting(.quit), .selectingWindow: base = 390
         case .selecting(.copy), .selecting(.message): base = 262
         }
         return base + (hasBadges ? 20 : 0)
@@ -290,6 +306,74 @@ enum QuickChatLayout {
     static func scrollFrame(height: CGFloat, hasBadges: Bool) -> NSRect {
         NSRect(x: 16, y: buttonsBottom, width: 308,
                height: max(36, headingY(height: height, hasBadges: hasBadges) - 12 - buttonsBottom))
+    }
+}
+
+// Window titles are the only content read from other apps. AX access never prompts here;
+// the user can still choose ordinary app activation when permission is unavailable.
+enum QuickWindowSwitcher {
+    struct Window {
+        let element: AXUIElement
+        let title: String
+        let minimized: Bool
+    }
+    enum Listing {
+        case available([Window])
+        case unavailable(String)
+    }
+
+    static func label(_ title: String?, index: Int, minimized: Bool) -> String {
+        let cleaned = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let name = cleaned.isEmpty ? "Untitled window \(index + 1)" : cleaned
+        return minimized ? "\(name) · Minimized" : name
+    }
+
+    static func windows(for pid: pid_t) -> Listing {
+        guard AXIsProcessTrustedWithOptions(nil) else {
+            return .unavailable("To choose a window, allow Eden in System Settings → Privacy & Security → Accessibility.")
+        }
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 1.5)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &value) == .success,
+              let elements = value as? [AXUIElement] else {
+            return .unavailable("This app doesn't provide a window list to Eden.")
+        }
+        let windows = elements.compactMap { element -> Window? in
+            var owner: pid_t = 0
+            guard AXUIElementGetPid(element, &owner) == .success, owner == pid else { return nil }
+            AXUIElementSetMessagingTimeout(element, 1.5)
+            var titleValue: CFTypeRef?
+            var minimizedValue: CFTypeRef?
+            _ = AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleValue)
+            _ = AXUIElementCopyAttributeValue(element, kAXMinimizedAttribute as CFString, &minimizedValue)
+            return Window(element: element, title: titleValue as? String ?? "",
+                          minimized: minimizedValue as? Bool ?? false)
+        }
+        return .available(windows)
+    }
+
+    static func activate(_ window: Window, in running: NSRunningApplication) -> Bool {
+        let pid = running.processIdentifier
+        guard !running.isTerminated, AXIsProcessTrustedWithOptions(nil) else { return false }
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 1.5)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &value) == .success,
+              let current = value as? [AXUIElement],
+              current.contains(where: { CFEqual($0, window.element) }) else { return false }
+        var minimizedValue: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(window.element, kAXMinimizedAttribute as CFString, &minimizedValue)
+        if minimizedValue as? Bool == true &&
+            AXUIElementSetAttributeValue(window.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse) != .success {
+            return false
+        }
+        guard AXUIElementPerformAction(window.element, kAXRaiseAction as CFString) == .success else { return false }
+        _ = AXUIElementSetAttributeValue(application, kAXFocusedWindowAttribute as CFString, window.element)
+        guard running.activate(options: []) else { return false }
+        var focused: CFTypeRef?
+        return AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute as CFString, &focused) == .success &&
+            focused.map { CFEqual($0, window.element) } == true
     }
 }
 
@@ -1669,6 +1753,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     private var quickFlow = QuickActionFlow()
     private var quickCatalog: [InstalledApplication] = []
     private var quickTargets: [(app: InstalledApplication, pid: pid_t?)] = []
+    private var quickSwitchTarget: (app: InstalledApplication, pid: pid_t)?
+    private var quickWindowTargets: [QuickWindowSwitcher.Window] = []
+    private var quickWindowFallback: String?
+    private var quickAppSearch = ""
     private var quickFolders: [DesktopFolder] = []
     private var quickLoading = false
     private var quickRows: [NSView] = []
@@ -1723,12 +1811,19 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         }
         lastApp = NSWorkspace.shared.frontmostApplication
 
-        // start on the screen the mouse is on
-        let mouse = NSEvent.mouseLocation
-        var scr = (NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main!).visibleFrame
-        if let i = Int(ProcessInfo.processInfo.environment["PB_SCREEN"] ?? ""), i < NSScreen.screens.count { scr = NSScreen.screens[i].visibleFrame }
-        let initialFrame = PetChatLayout.petFrame(
-            NSRect(x: scr.midX - w/2, y: scr.minY + 18, width: w, height: h), visible: scr)
+        // A saved drag position wins while its centre remains on a connected display.
+        let screens = NSScreen.screens
+        guard let primary = screens.first else { return }
+        let stored = UserDefaults.standard.dictionary(forKey: "edenPetPosition")
+        let savedOrigin: NSPoint? = {
+            guard let x = stored?["x"] as? Double, let y = stored?["y"] as? Double else { return nil }
+            return NSPoint(x: x, y: y)
+        }()
+        let initialFrame = PetChatLayout.spawnFrame(size: NSSize(width: w, height: h),
+            primaryVisible: primary.visibleFrame, savedOrigin: savedOrigin,
+            visibleFrames: screens.map(\.visibleFrame))
+        let scr = screens.first { $0.visibleFrame.contains(NSPoint(x: initialFrame.midX, y: initialFrame.midY)) }?.visibleFrame
+            ?? primary.visibleFrame
         panel = Panel(contentRect: initialFrame,
                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .floating
@@ -2612,6 +2707,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 quickContent.addSubview(quickSearch)
                 renderQuickList()
             }
+        case .selectingWindow:
+            quickSectionLabel.stringValue = quickSwitchTarget.map { "\($0.app.displayName) Windows" } ?? "Windows"
+            quickSearch.placeholderString = "Search windows"
+            if quickWindowFallback == nil { quickContent.addSubview(quickSearch) }
+            renderQuickWindowList()
         }
     }
 
@@ -2657,7 +2757,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 $0.app.url != target.app.url && $0.app.displayName == target.app.displayName
             }
             let location = duplicate ? " · \(target.app.url.deletingLastPathComponent().path)" : ""
-            let suffix = location + (target.pid.map { " · PID \($0)" } ?? "")
+            let sameCopy = quickTargets.filter { $0.app.url == target.app.url && $0.app.displayName == target.app.displayName }
+            let instance = sameCopy.count > 1
+                ? " · Instance \(quickTargets[...index].filter { $0.app.url == target.app.url && $0.app.displayName == target.app.displayName }.count)" : ""
+            let suffix = location + instance
             let button = NSButton(title: target.app.displayName + suffix, target: self, action: #selector(chooseQuickApp(_:)))
             button.tag = index
             button.image = NSWorkspace.shared.icon(forFile: target.app.url.path)
@@ -2674,6 +2777,51 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         chatPanel.recalculateKeyViewLoop()
     }
 
+    private func renderQuickWindowList() {
+        guard quickFlow.state == .selectingWindow else { return }
+        quickRows.forEach { $0.removeFromSuperview() }
+        quickRows = []
+        let search = LauncherAppResolver.normalized(quickSearch.stringValue)
+        let visible = quickWindowTargets.enumerated().filter {
+            search.isEmpty || LauncherAppResolver.normalized(QuickWindowSwitcher.label($0.element.title,
+                index: $0.offset, minimized: $0.element.minimized)).contains(search)
+        }
+        let contentHeight = max(quickScroll.contentSize.height,
+                                CGFloat(max(visible.count, 1)) * 34 + (quickWindowFallback == nil ? 44 : 112))
+        quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: contentHeight)
+        if let reason = quickWindowFallback {
+            let note = NSTextField(wrappingLabelWithString: reason)
+            note.textColor = NSColor(white: 1, alpha: 0.8)
+            note.frame = NSRect(x: 4, y: contentHeight - 100, width: W - 44, height: 88)
+            quickContent.addSubview(note); quickRows.append(note)
+            if let target = quickSwitchTarget {
+                let button = NSButton(title: "Activate \(target.app.displayName) normally", target: self,
+                                      action: #selector(activateQuickAppNormally))
+                styleQuickRow(button, y: contentHeight - 138)
+            }
+        } else {
+            quickSearch.frame = NSRect(x: 0, y: contentHeight - 30, width: W - 48, height: 26)
+            if visible.isEmpty {
+                let note = NSTextField(labelWithString: "No matching windows")
+                note.textColor = NSColor(white: 1, alpha: 0.7)
+                note.frame = NSRect(x: 4, y: contentHeight - 67, width: W - 48, height: 20)
+                quickContent.addSubview(note); quickRows.append(note)
+            }
+            for (position, entry) in visible.enumerated() {
+                let title = QuickWindowSwitcher.label(entry.element.title, index: entry.offset,
+                                                        minimized: entry.element.minimized)
+                let repeated = quickWindowTargets.filter { $0.title == entry.element.title }.count > 1
+                let button = NSButton(title: repeated ? "\(title) · Window \(entry.offset + 1)" : title,
+                                      target: self, action: #selector(chooseQuickWindow(_:)))
+                button.tag = entry.offset
+                button.toolTip = title
+                styleQuickRow(button, y: contentHeight - 68 - CGFloat(position) * 34)
+            }
+        }
+        quickContent.scroll(NSPoint(x: 0, y: max(0, contentHeight - quickScroll.contentSize.height)))
+        chatPanel.recalculateKeyViewLoop()
+    }
+
     private func styleQuickRow(_ button: NSButton, y: CGFloat) {
         button.frame = NSRect(x: 0, y: y, width: W - 48, height: 30)
         button.bezelStyle = .rounded
@@ -2685,7 +2833,10 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     }
 
     func controlTextDidChange(_ notification: Notification) {
-        if notification.object as? NSSearchField === quickSearch { renderQuickList() }
+        if notification.object as? NSSearchField === quickSearch {
+            if quickFlow.state == .selectingWindow { renderQuickWindowList() }
+            else { renderQuickList() }
+        }
     }
 
     @objc private func chooseQuickAction(_ sender: NSButton) {
@@ -2696,6 +2847,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         }
         quickFlow.begin(action)
         quickSearch.stringValue = ""
+        quickSwitchTarget = nil; quickWindowTargets = []; quickWindowFallback = nil; quickAppSearch = ""
         if action == .open { quickCatalog = [] }
         quickLoading = action == .open
         refreshQuickActions()
@@ -2713,14 +2865,20 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     @objc private func quickBack() {
         guard !sending else { showBubble("Wait for this action to finish.", project: "Eden", react: false); return }
+        let leavingWindows = quickFlow.state == .selectingWindow
         quickFlow.back()
+        if leavingWindows {
+            quickSearch.stringValue = quickAppSearch
+            quickSwitchTarget = nil; quickWindowTargets = []; quickWindowFallback = nil
+        }
         refreshQuickActions()
-        chatPanel.makeFirstResponder(field)
+        chatPanel.makeFirstResponder(leavingWindows ? quickSearch : field)
     }
 
     @objc private func quickCancel() {
         guard !sending else { showBubble("Wait for this action to finish.", project: "Eden", react: false); return }
         quickFlow.cancel()
+        quickSwitchTarget = nil; quickWindowTargets = []; quickWindowFallback = nil
         refreshQuickActions()
         chatPanel.makeFirstResponder(field)
         showBubble("Okay, cancelled. Your draft is still here.", project: "Eden", react: false)
@@ -2738,6 +2896,49 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         guard quickTargets.indices.contains(sender.tag), case .selecting(let action) = quickFlow.state,
               let appAction = action.appAction, !sending else { return }
         let target = quickTargets[sender.tag]
+        if action == .switchTo {
+            guard let pid = target.pid, runningCopy(of: target.app, preferredPID: pid) != nil else {
+                dot.worry()
+                showBubble("\(target.app.displayName) isn't running. Your draft is still here.", project: "Eden", react: false)
+                renderQuickList()
+                return
+            }
+            sending = true; dot.processing = true
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let listing = QuickWindowSwitcher.windows(for: pid)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.sending = false; self.dot.processing = false
+                    guard self.quickFlow.state == .selecting(.switchTo),
+                          let running = self.runningCopy(of: target.app, preferredPID: pid) else { return }
+                    self.quickSwitchTarget = (target.app, pid)
+                    self.quickAppSearch = self.quickSearch.stringValue
+                    self.quickSearch.stringValue = ""
+                    switch listing {
+                    case .available(let windows) where windows.count == 1:
+                        if QuickWindowSwitcher.activate(windows[0], in: running) {
+                            self.finishQuickWindowSwitch(true, "Switched to \(target.app.displayName)")
+                            return
+                        }
+                        self.quickWindowTargets = []
+                        self.quickWindowFallback = "Eden couldn't confirm that window is available. You can activate the app normally."
+                    case .available(let windows) where windows.count > 1:
+                        self.quickWindowTargets = windows
+                        self.quickWindowFallback = nil
+                    case .available:
+                        self.quickWindowTargets = []
+                        self.quickWindowFallback = "No accessible windows were found for \(target.app.displayName). You can activate the app normally."
+                    case .unavailable(let reason):
+                        self.quickWindowTargets = []
+                        self.quickWindowFallback = reason + " You can activate the app normally."
+                    }
+                    self.quickFlow.selectWindow()
+                    self.refreshQuickActions()
+                    if self.quickWindowFallback == nil { self.chatPanel.makeFirstResponder(self.quickSearch) }
+                }
+            }
+            return
+        }
         sending = true; dot.processing = true
         performAppAction(appAction, on: target.app, preferredPID: target.pid) { [weak self] success, message in
             guard let self else { return }
@@ -2745,6 +2946,41 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             if success { self.dot.happy(); self.quickFlow.back(); self.refreshQuickActions() }
             else { self.dot.worry(); self.renderQuickList() }
             self.showBubble(message + (success ? "." : ". Your draft is still here."), project: "Eden", react: false)
+        }
+    }
+
+    private func finishQuickWindowSwitch(_ success: Bool, _ message: String) {
+        sending = false; dot.processing = false
+        if success {
+            dot.happy(); quickFlow.cancel()
+            quickSwitchTarget = nil; quickWindowTargets = []; quickWindowFallback = nil
+            refreshQuickActions()
+        } else {
+            dot.worry()
+            if quickFlow.state == .selectingWindow { renderQuickWindowList() }
+        }
+        showBubble(message + (success ? "." : ". Your draft is still here."), project: "Eden", react: false)
+    }
+
+    @objc private func chooseQuickWindow(_ sender: NSButton) {
+        guard quickFlow.state == .selectingWindow, quickWindowTargets.indices.contains(sender.tag),
+              let target = quickSwitchTarget, !sending else { return }
+        guard let running = runningCopy(of: target.app, preferredPID: target.pid) else {
+            finishQuickWindowSwitch(false, "\(target.app.displayName) isn't running")
+            return
+        }
+        let window = quickWindowTargets[sender.tag]
+        let success = QuickWindowSwitcher.activate(window, in: running)
+        finishQuickWindowSwitch(success, success ? "Switched to \(target.app.displayName): \(window.title.isEmpty ? "Untitled window" : window.title)"
+                                         : "That window is no longer available or couldn't be focused")
+    }
+
+    @objc private func activateQuickAppNormally() {
+        guard quickFlow.state == .selectingWindow, let target = quickSwitchTarget, !sending else { return }
+        sending = true; dot.processing = true
+        performAppAction(.switchTo, on: target.app, preferredPID: target.pid) { [weak self] success, message in
+            self?.finishQuickWindowSwitch(success, success
+                ? "Activated \(target.app.displayName) normally; no window was selected" : message)
         }
     }
 
@@ -3020,6 +3256,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     // the bubble follows the bar when it's dragged or resized
     func windowDidMove(_ n: Notification) {
         guard n.object as? NSWindow === panel else { return }
+        UserDefaults.standard.set(["x": Double(panel.frame.minX), "y": Double(panel.frame.minY)],
+                                  forKey: "edenPetPosition")
         positionChat()
         repositionPanels()
         // flung: the goo stretches behind and jiggles
