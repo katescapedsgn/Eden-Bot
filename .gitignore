@@ -1,2 +1,17 @@
 build/
 .DS_Store
+
+# Local signing material and machine-specific settings
+*.p12
+*.p8
+*.key
+*.pem
+*.mobileprovision
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.*.example
+!.env.*.sample
+!.env.*.template

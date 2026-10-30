@@ -37,7 +37,8 @@ Eden also has optional advanced controls for Claude Code and Codex CLI Terminal 
 
 - macOS 13 or later
 - Apple Swift command-line tools
-- A suitable signing identity for signed installation, or explicit ad hoc signing for local testing
+
+You can build Eden without a signing certificate. The `Eden Local Signing` certificate is specific to the developer's Mac and is only needed for the default signed installation. Public users do not need it.
 
 ### Build
 
@@ -46,19 +47,25 @@ cd "$HOME/Documents/GitHub/Eden Bot"
 bash scripts/install-local.sh --build-only
 ```
 
+Without `Eden Local Signing`, build-only mode produces an unsigned app for validation.
+
 ### Install
 
-```bash
-bash scripts/install-local.sh --install
-```
-
-For local ad hoc signing:
+For a local installation without the developer's certificate, explicitly choose ad hoc signing:
 
 ```bash
 bash scripts/install-local.sh --install --ad-hoc
 ```
 
-The installer builds and validates `Eden.app` but does not launch it automatically.
+The installer asks you to confirm ad hoc signing and backs up an existing Eden app before replacing it. macOS may ask you to approve Accessibility or Automation permissions again after a rebuild.
+
+If you have your own valid `Eden Local Signing` certificate and private key in Keychain, use the default signed installation:
+
+```bash
+bash scripts/install-local.sh --install
+```
+
+The installer builds and validates `Eden.app` but does not launch it automatically. Developer ID signing and notarisation are not currently provided.
 
 **Migrating from Katescape:** If `~/Applications/Katescape.app` still exists, quit it and move it to a safe backup location before installing Eden. Keep the backup until Eden has been tested.
 

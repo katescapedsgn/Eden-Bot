@@ -4,6 +4,199 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) {
     guard condition() else { fputs("FAIL: \(message)\n", stderr); exit(1) }
 }
 
+let idleResource = URL(fileURLWithPath: ProcessInfo.processInfo.environment["EDEN_DIALOGUE_SOURCE"] ?? "")
+guard let idleDialogue = IdleThoughtsDialogue.load(from: idleResource) else {
+    fputs("FAIL: Idle Thoughts dialogue resource\n", stderr); exit(1)
+}
+check(idleDialogue.categories.count == 5 && idleDialogue.categories.allSatisfy { (10...15).contains($0.lines.count) },
+      "five dialogue categories with 10–15 lines each")
+check(IdleThoughtsDialogue.load(from: nil) == nil, "missing dialogue fails safely")
+let badDialogue = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+try! Data(#"{"categories":[{"id":"a","lines":["same","same"]}]}"#.utf8).write(to: badDialogue)
+check(IdleThoughtsDialogue.load(from: badDialogue) == nil, "duplicate dialogue rejected")
+try! FileManager.default.removeItem(at: badDialogue)
+let start = Date(timeIntervalSince1970: 1_000_000)
+let pettingResource = URL(fileURLWithPath: ProcessInfo.processInfo.environment["EDEN_PETTING_SOURCE"] ?? "")
+guard let pettingLines = PettingDialogue.load(from: pettingResource) else {
+    fputs("FAIL: Petting Dialogue resource\n", stderr); exit(1)
+}
+check((12...16).contains(pettingLines.lines.count) && Set(pettingLines.lines).count == pettingLines.lines.count,
+      "petting dialogue count and uniqueness")
+let idleLines = Set(idleDialogue.categories.flatMap(\.lines))
+check(pettingLines.lines.allSatisfy { !idleLines.contains($0) }, "petting lines do not copy idle thoughts")
+check(PettingDialogue.load(from: nil) == nil, "missing petting dialogue fails safely")
+let badPetting = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+try! Data(#"{"lines":["same","same"]}"#.utf8).write(to: badPetting)
+check(PettingDialogue.load(from: badPetting) == nil, "duplicate petting dialogue rejected")
+try! Data(#"{"lines":[" "]}"#.utf8).write(to: badPetting)
+check(PettingDialogue.load(from: badPetting) == nil, "blank petting dialogue rejected")
+try! Data(#"{"lines": ["broken""#.utf8).write(to: badPetting)
+check(PettingDialogue.load(from: badPetting) == nil, "malformed petting dialogue rejected")
+try! FileManager.default.removeItem(at: badPetting)
+check((0..<500).allSatisfy { _ in (30...60).contains(PettingDialogueScheduler.randomCooldown()) },
+      "petting cooldown is 30–60 seconds")
+var pettingScheduler = PettingDialogueScheduler(dialogue: pettingLines)
+check(pettingScheduler.observe(now: start, hoverStart: 1, hoverAge: 0.6,
+                               enabled: true, eligible: true) == nil,
+      "petting sprite threshold does not immediately trigger dialogue")
+check(pettingScheduler.observe(now: start, hoverStart: 1, hoverAge: 2.19,
+                               enabled: true, eligible: true) == nil,
+      "sustained petting must reach 2.2 seconds")
+let firstPet = pettingScheduler.observe(now: start, hoverStart: 1, hoverAge: 2.2,
+                                        enabled: true, eligible: true, cooldown: { 30 }, choose: { _ in 0 })
+check(firstPet != nil && pettingScheduler.nextAllowed == start.addingTimeInterval(30),
+      "sustained petting shows one line and arms cooldown")
+check(pettingScheduler.observe(now: start.addingTimeInterval(31), hoverStart: 1, hoverAge: 33,
+                               enabled: true, eligible: true) == nil,
+      "continuous hover never retriggers dialogue")
+_ = pettingScheduler.observe(now: start, hoverStart: nil, hoverAge: 0, enabled: true, eligible: true)
+check(pettingScheduler.observe(now: start.addingTimeInterval(20), hoverStart: 2, hoverAge: 2.2,
+                               enabled: true, eligible: true) == nil,
+      "new hover during cooldown has no dialogue")
+check(pettingScheduler.observe(now: start.addingTimeInterval(31), hoverStart: 2, hoverAge: 13,
+                               enabled: true, eligible: true) == nil,
+      "cooldown expiry does not queue dialogue within a blocked hover")
+var chosenPets: [String] = [firstPet!]
+for index in 3...9 {
+    _ = pettingScheduler.observe(now: start, hoverStart: nil, hoverAge: 0, enabled: true, eligible: true)
+    let line = pettingScheduler.observe(now: start.addingTimeInterval(Double(index * 61)),
+                                        hoverStart: Double(index), hoverAge: 2.2,
+                                        enabled: true, eligible: true, cooldown: { 30 }, choose: { _ in 0 })
+    check(line != nil && !chosenPets.suffix(5).contains(line!), "previous five petting lines do not repeat")
+    chosenPets.append(line!)
+}
+_ = pettingScheduler.observe(now: start, hoverStart: nil, hoverAge: 0, enabled: true, eligible: true)
+check(pettingScheduler.observe(now: start.addingTimeInterval(1000), hoverStart: 10, hoverAge: 2.2,
+                               enabled: false, eligible: true) == nil &&
+      pettingScheduler.observe(now: start.addingTimeInterval(1001), hoverStart: 10, hoverAge: 3.2,
+                               enabled: true, eligible: true) == nil,
+      "disabled petting dialogue cannot appear later in the same hover")
+_ = pettingScheduler.observe(now: start, hoverStart: nil, hoverAge: 0, enabled: true, eligible: true)
+check(pettingScheduler.observe(now: start.addingTimeInterval(1100), hoverStart: 11, hoverAge: 2.2,
+                               enabled: true, eligible: false) == nil,
+      "chat, quick actions, sleep and important bubbles suppress casual dialogue")
+var disabledIdleScheduler = IdleThoughtsScheduler(dialogue: idleDialogue)
+var independentPetting = PettingDialogueScheduler(dialogue: pettingLines)
+check(disabledIdleScheduler.tick(at: start, eligible: false) == nil &&
+      independentPetting.observe(now: start, hoverStart: 12, hoverAge: 2.2,
+                                 enabled: true, eligible: true) != nil,
+      "petting dialogue remains available when Idle Thoughts are disabled")
+var bubbles = BubbleCoordinator()
+let petGeneration = bubbles.offer(.petting)!
+check(bubbles.offer(.idleThought) == nil && bubbles.generation == petGeneration,
+      "idle thought cannot replace petting dialogue")
+let feedbackGeneration = bubbles.offer(.feedback)!
+check(bubbles.offer(.petting) == nil && bubbles.offer(.idleThought) == nil,
+      "petting and idle thoughts cannot replace command feedback")
+check(bubbles.dismiss(ifGeneration: petGeneration) == nil && bubbles.generation == feedbackGeneration,
+      "stale petting dismissal cannot close command feedback")
+let providerGeneration = bubbles.offer(.provider)!
+check(providerGeneration > feedbackGeneration && bubbles.offer(.petting) == nil,
+      "provider response supersedes earlier feedback and blocks petting")
+let fadedGeneration = bubbles.dismiss(ifGeneration: providerGeneration)!
+let newerGeneration = bubbles.offer(.feedback)!
+check(fadedGeneration != newerGeneration && bubbles.dismiss(ifGeneration: providerGeneration) == nil &&
+      bubbles.priority == .feedback,
+      "stale fade completion cannot close a newer bubble")
+var idleScheduler = IdleThoughtsScheduler(dialogue: idleDialogue)
+check(IdleThoughtsScheduler.displayDuration == 4, "thought bubble duration remains four seconds")
+check((0..<500).allSatisfy { _ in (120...240).contains(IdleThoughtsScheduler.randomFirstDelay()) &&
+      (360...540).contains(IdleThoughtsScheduler.randomSecondDelay()) },
+      "first and second thoughts stay within their two to four and six to nine minute windows")
+check(idleScheduler.tick(at: start, eligible: true, firstDelay: { 120 }, secondDelay: { 360 }) == nil &&
+      idleScheduler.nextDue == start.addingTimeInterval(120) &&
+      idleScheduler.secondDue == start.addingTimeInterval(360),
+      "one eligible cycle schedules two separated thoughts")
+check(idleScheduler.tick(at: start.addingTimeInterval(119), eligible: true) == nil,
+      "first thought stays hidden before its due time")
+let firstCycleLine = idleScheduler.tick(at: start.addingTimeInterval(120), eligible: true)
+idleScheduler.completeDisplay()
+check(firstCycleLine != nil && idleScheduler.thoughtsShown == 1 &&
+      idleScheduler.tick(at: start.addingTimeInterval(359), eligible: true) == nil,
+      "first thought displays once and the second remains separated")
+let secondCycleLine = idleScheduler.tick(at: start.addingTimeInterval(360), eligible: true)
+idleScheduler.completeDisplay()
+check(secondCycleLine != nil && secondCycleLine != firstCycleLine && idleScheduler.thoughtsShown == 2 &&
+      idleScheduler.tick(at: start.addingTimeInterval(600), eligible: true) == nil,
+      "exactly two distinct thoughts appear in one ten-minute cycle")
+var displayed: [String] = []
+var categories: [String] = []
+for index in 0..<20 {
+    idleScheduler.restartAfterInteraction()
+    let cycleStart = start.addingTimeInterval(Double(index * 700 + 1000))
+    _ = idleScheduler.tick(at: cycleStart, eligible: true, firstDelay: { 120 }, secondDelay: { 360 })
+    for offset in [120.0, 360.0] {
+        guard let line = idleScheduler.tick(at: cycleStart.addingTimeInterval(offset), eligible: true) else {
+            fputs("FAIL: due idle thought missing\n", stderr); exit(1)
+        }
+        check(!displayed.suffix(10).contains(line), "previous ten thoughts are not repeated")
+        displayed.append(line)
+        categories.append(idleScheduler.lastCategory ?? "")
+        idleScheduler.completeDisplay()
+    }
+}
+check(zip(categories, categories.dropFirst()).allSatisfy { $0 != $1 },
+      "consecutive thoughts use different categories")
+idleScheduler.pause()
+check(idleScheduler.nextDue == nil &&
+      idleScheduler.tick(at: start.addingTimeInterval(20_000), eligible: false) == nil &&
+      idleScheduler.tick(at: start.addingTimeInterval(20_001), eligible: true,
+                         firstDelay: { 240 }, secondDelay: { 540 }) == nil &&
+      idleScheduler.nextDue == start.addingTimeInterval(20_241),
+      "sleep or interaction restarts a fresh two-thought cycle")
+
+for night in [false, true] {
+    var cycle = IdleThoughtsScheduler(dialogue: idleDialogue)
+    check(cycle.tick(at: start, eligible: true, firstDelay: { 240 }, secondDelay: { 540 }) == nil,
+          "two thoughts arm at four and nine minutes")
+    let threshold = EdenAutoSleep.threshold(night: night)
+    check(threshold == (night ? 60 : 300), "original day and night sleep thresholds")
+    let beforeFirst = start.addingTimeInterval(night ? 61 : 239)
+    check(!EdenAutoSleep.shouldSleep(inactiveFor: night ? 61 : 239, night: night, now: beforeFirst,
+                                    deferredUntil: cycle.sleepDeferralDeadline(at: beforeFirst,
+                                                                              enabled: true, eligible: true)),
+          "pending first thought defers automatic sleep")
+    let firstTime = start.addingTimeInterval(240)
+    check(cycle.tick(at: firstTime, eligible: true) != nil, "first thought appears")
+    cycle.completeDisplay()
+    let between = start.addingTimeInterval(301)
+    check(!EdenAutoSleep.shouldSleep(inactiveFor: 301, night: night, now: between,
+                                    deferredUntil: cycle.sleepDeferralDeadline(at: between,
+                                                                              enabled: true, eligible: true)),
+          "sleep remains deferred between the two thoughts")
+    let secondTime = start.addingTimeInterval(540)
+    check(cycle.tick(at: secondTime, eligible: true) != nil, "second thought appears")
+    let duringBubble = secondTime.addingTimeInterval(3)
+    check(cycle.sleepDeferralDeadline(at: duringBubble, enabled: true, eligible: true) ==
+          secondTime.addingTimeInterval(5), "second thought remains visible for four seconds")
+    cycle.completeDisplay()
+    check(cycle.sleepDeferralDeadline(at: secondTime.addingTimeInterval(4),
+                                      enabled: true, eligible: true) == nil &&
+          EdenAutoSleep.shouldSleep(inactiveFor: 544, night: night,
+                                    now: secondTime.addingTimeInterval(4), deferredUntil: nil),
+          "sleep resumes after the second thought closes")
+    check(cycle.sleepDeferralDeadline(at: secondTime.addingTimeInterval(4),
+                                      enabled: false, eligible: true) == nil,
+          "disabling thoughts never defers sleep")
+    cycle.restartAfterInteraction()
+    check(cycle.thoughtsShown == 0 && cycle.nextDue == nil && cycle.displayDeadline == nil &&
+          !EdenAutoSleep.shouldSleep(inactiveFor: 0, night: night,
+                                     now: secondTime, deferredUntil: nil),
+          "interaction cancels the pending sleep transition")
+}
+var interruptedCycle = IdleThoughtsScheduler(dialogue: idleDialogue)
+_ = interruptedCycle.tick(at: start, eligible: true, firstDelay: { 120 }, secondDelay: { 360 })
+check(interruptedCycle.sleepDeferralDeadline(at: start.addingTimeInterval(1),
+                                             enabled: true, eligible: false) == nil,
+      "ineligible state releases sleep deferral")
+check(interruptedCycle.tick(at: start.addingTimeInterval(129), eligible: true) == nil &&
+      interruptedCycle.sleepDeferralDeadline(at: start.addingTimeInterval(129),
+                                             enabled: true, eligible: true) == nil,
+      "missed thoughts do not queue or defer sleep indefinitely")
+check(EdenAutoSleep.shouldSleep(inactiveFor: 301, night: false, now: start, deferredUntil: nil) &&
+      EdenAutoSleep.shouldSleep(inactiveFor: 61, night: true, now: start, deferredUntil: nil),
+      "disabled or missing dialogue preserves original automatic sleep")
+
 func catFrame(_ time: Double = 0, sleepAge: Double? = nil, thinking: Bool = false,
               asking: Bool = false, petting: Bool = false, worried: Bool = false,
               happyAge: Double = -1, blinkAge: Double = -1,
@@ -55,6 +248,69 @@ check(catFrame(sleepAge: 0, waveAge: 0.3, confusedAge: 0.3).kind == .sleeping &&
       catFrame(petting: true, waveAge: 0.3, pettingAge: 0.3).kind == .wave &&
       catFrame(thinking: true, waveAge: 0.3, confusedAge: 0.3).kind == .confused,
       "sleep and error priorities prevent conflicting animations")
+var thoughtVisual = IdleThoughtThinking()
+thoughtVisual.setVisible(true, at: 10)
+check(thoughtVisual.isVisible && thoughtVisual.frameAge(at: 10) == 0 &&
+      EdenAnimation.select(catTime: 10, sleepAge: nil, thinking: true, asking: false,
+                           petting: false, worried: false, happyAge: -1, blinkAge: -1,
+                           thinkingAge: thoughtVisual.frameAge(at: 10)) == .init(kind: .thinking, index: 0),
+      "an Idle Thought begins on the first Thinking frame")
+check(EdenAnimation.select(catTime: 10.35, sleepAge: nil, thinking: true, asking: false,
+                           petting: false, worried: false, happyAge: -1, blinkAge: -1,
+                           thinkingAge: thoughtVisual.frameAge(at: 10.35)) == .init(kind: .thinking, index: 1),
+      "Idle Thought Thinking loops using existing frames")
+thoughtVisual.setVisible(false, at: 10.5)
+check(!thoughtVisual.isVisible && thoughtVisual.frameAge(at: 10.5) == 0,
+      "dismissing or replacing a thought stops its visual state")
+thoughtVisual.setVisible(true, at: 12)
+check(thoughtVisual.frameAge(at: 12) == 0 &&
+      catFrame(12, sleepAge: 0, thinking: true).kind == .sleeping &&
+      catFrame(12, thinking: true, asking: true).kind == .idle &&
+      catFrame(12, thinking: true, confusedAge: 0.3).kind == .confused,
+      "each thought restarts Thinking without overriding sleep, questions or errors")
+check(thoughtVisual.shouldRender(realProcessing: false, canDraw: true, petting: false,
+                                 waveAge: 10, happyAge: 10) &&
+      !thoughtVisual.shouldRender(realProcessing: true, canDraw: true, petting: false,
+                                  waveAge: 10, happyAge: 10) &&
+      !thoughtVisual.shouldRender(realProcessing: false, canDraw: true, petting: true,
+                                  waveAge: 10, happyAge: 10) &&
+      !thoughtVisual.shouldRender(realProcessing: false, canDraw: true, petting: false,
+                                  waveAge: 0.2, happyAge: 10) &&
+      !thoughtVisual.shouldRender(realProcessing: false, canDraw: true, petting: false,
+                                  waveAge: 10, happyAge: 0.2),
+      "real processing, petting, wave and happy take priority over thought Thinking")
+thoughtVisual.setVisible(false, at: 12.5)
+check(!thoughtVisual.shouldRender(realProcessing: false, canDraw: true, petting: false,
+                                  waveAge: 10, happyAge: 10),
+      "dismissed thoughts cannot leave a Thinking frame behind")
+check(DesktopActionOutcome.succeeded.combined(with: .succeeded) == .succeeded &&
+      DesktopActionOutcome.succeeded.combined(with: .cancelled) == .cancelled &&
+      DesktopActionOutcome.cancelled.combined(with: .failed) == .failed,
+      "app outcomes keep cancellation separate from failure")
+var thinkingHold = ThinkingVisibility()
+check(thinkingHold.update(now: 1, phaseTime: 7, requested: true, canDraw: true) &&
+      thinkingHold.frameAge(at: 7) == 0,
+      "a new processing session begins with the first Thinking frame")
+check(thinkingHold.update(now: 1.3, phaseTime: 7.3, requested: false, canDraw: true) &&
+      thinkingHold.isHolding(at: 1.3),
+      "completed asynchronous work retains visible Thinking briefly")
+check(EdenAnimation.select(catTime: 7.31, sleepAge: nil, thinking: true, asking: false,
+                           petting: false, worried: false, happyAge: -1, blinkAge: -1,
+                           thinkingAge: thinkingHold.frameAge(at: 7.31)) == .init(kind: .thinking, index: 1),
+      "Thinking frame clock resets independently of the global animation clock")
+check(!thinkingHold.update(now: 1.6, phaseTime: 7.6, requested: false, canDraw: true) &&
+      catFrame(7.6, happyAge: 0).kind == .happy,
+      "Thinking hold ends before Happy plays")
+check(thinkingHold.update(now: 2, phaseTime: 9, requested: true, canDraw: true) &&
+      !thinkingHold.update(now: 2.1, phaseTime: 9.1, requested: false, canDraw: false) &&
+      !thinkingHold.isHolding(at: 2.1),
+      "failure or cancellation clears stale Thinking")
+check(catFrame(9.1, thinking: true, confusedAge: 0.3).kind == .confused,
+      "Confused supersedes processing on genuine failure")
+thinkingHold.reset()
+check(!thinkingHold.update(now: 3, phaseTime: 10, requested: false, canDraw: true) &&
+      catFrame(10, happyAge: 0).kind == .happy,
+      "instant operations can show Happy without a synthetic Thinking delay")
 check(EdenAnimation.overlays(for: catFrame(), asking: false, petting: false, worried: false).isEmpty,
       "idle has no legacy effects")
 check(EdenAnimation.overlays(for: catFrame(blinkAge: 0), asking: false, petting: false, worried: false).isEmpty,

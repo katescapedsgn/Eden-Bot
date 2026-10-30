@@ -42,9 +42,11 @@ final class PillGlass: NSVisualEffectView {
 
 final class PetHandle: NSView {
     var onClick: (() -> Void)?
+    var onInteraction: (() -> Void)?
     private var downEvent: NSEvent?
     private var dragged = false
-    override func mouseDown(with event: NSEvent) { downEvent = event; dragged = false }
+    var isInteracting: Bool { downEvent != nil || dragged }
+    override func mouseDown(with event: NSEvent) { onInteraction?(); downEvent = event; dragged = false }
     override func mouseDragged(with event: NSEvent) {
         guard let downEvent, !dragged else { return }
         let a = downEvent.locationInWindow, b = event.locationInWindow
@@ -738,6 +740,19 @@ enum DesktopAppAction {
     }
 }
 
+enum DesktopActionOutcome: Equatable {
+    case succeeded, failed, cancelled
+
+    var isSuccess: Bool { self == .succeeded }
+    var isFailure: Bool { self == .failed }
+
+    func combined(with next: DesktopActionOutcome) -> DesktopActionOutcome {
+        if self == .failed || next == .failed { return .failed }
+        if self == .cancelled || next == .cancelled { return .cancelled }
+        return .succeeded
+    }
+}
+
 struct LauncherAppResolver {
     private enum AliasTarget {
         case bundleID(String)
@@ -1299,7 +1314,8 @@ enum EdenAnimation {
 
     static func select(catTime: Double, sleepAge: Double?, thinking: Bool, asking: Bool,
                        petting: Bool, worried: Bool, happyAge: Double, blinkAge: Double,
-                       waveAge: Double = -1, pettingAge: Double = -1, confusedAge: Double = -1) -> Frame {
+                       waveAge: Double = -1, pettingAge: Double = -1, confusedAge: Double = -1,
+                       thinkingAge: Double? = nil) -> Frame {
         if let sleepAge {
             // Slow breathing between frames 1 and 3; ears rise briefly once every eight seconds.
             let index = sleepAge.truncatingRemainder(dividingBy: 8) >= 7.2 ? 1 :
@@ -1311,7 +1327,7 @@ enum EdenAnimation {
             return Frame(kind: confusedAge < 0.2 || confusedAge >= 0.8 ? .idle : .confused, index: 0)
         }
         if worried { return Frame(kind: .idle, index: 0) }
-        if thinking { return Frame(kind: .thinking, index: Int(catTime / 0.3) % 4) }
+        if thinking { return Frame(kind: .thinking, index: Int(max(0, thinkingAge ?? catTime) / 0.3) % 4) }
         if waveAge >= 0 && waveAge < 0.8 {
             return Frame(kind: waveAge < 0.2 || waveAge >= 0.6 ? .idle : .wave, index: 0)
         }
@@ -1334,6 +1350,56 @@ enum EdenAnimation {
         if asking { return [.question] }
         if worried { return [.warning] }
         return petting ? [.heart] : []
+    }
+}
+
+struct ThinkingVisibility {
+    static let minimum: Double = 0.6
+    private(set) var firstDrawnAt: Double?
+    private(set) var phaseStart: Double?
+    private(set) var isShowing = false
+
+    mutating func reset() {
+        firstDrawnAt = nil; phaseStart = nil; isShowing = false
+    }
+
+    mutating func update(now: Double, phaseTime: Double, requested: Bool, canDraw: Bool) -> Bool {
+        guard canDraw else { reset(); return false }
+        if requested {
+            if firstDrawnAt == nil { firstDrawnAt = now; phaseStart = phaseTime }
+            isShowing = true
+            return true
+        }
+        if let firstDrawnAt, now - firstDrawnAt < Self.minimum {
+            isShowing = true
+            return true
+        }
+        reset()
+        return false
+    }
+
+    func isHolding(at now: Double) -> Bool {
+        firstDrawnAt.map { now - $0 < Self.minimum } ?? false
+    }
+
+    func frameAge(at phaseTime: Double) -> Double { phaseTime - (phaseStart ?? phaseTime) }
+}
+
+struct IdleThoughtThinking {
+    private(set) var startedAt: Double?
+    var isVisible: Bool { startedAt != nil }
+
+    mutating func setVisible(_ visible: Bool, at time: Double) {
+        if visible {
+            if startedAt == nil { startedAt = time }
+        } else { startedAt = nil }
+    }
+
+    func frameAge(at time: Double) -> Double { max(0, time - (startedAt ?? time)) }
+
+    func shouldRender(realProcessing: Bool, canDraw: Bool, petting: Bool,
+                      waveAge: Double, happyAge: Double) -> Bool {
+        isVisible && !realProcessing && canDraw && !petting && waveAge >= 0.8 && happyAge >= 0.8
     }
 }
 
@@ -1414,14 +1480,26 @@ enum CatSprites {
     }
 }
 
+enum EdenAutoSleep {
+    static func threshold(night: Bool) -> Double { night ? 60 : 300 }
+
+    static func shouldSleep(inactiveFor: Double, night: Bool, now: Date,
+                            deferredUntil: Date?) -> Bool {
+        inactiveFor > threshold(night: night) && !(deferredUntil.map { now < $0 } ?? false)
+    }
+}
+
 // a little goo blob drawn in chunky pixels. It breathes, blinks and follows the cursor; hops, throws, thinks,
 // sleeps, gets petted; and dresses for the time of day (coffee in the morning, sunglasses on Friday afternoon, a nightcap late)
 final class Goo: NSView {
     let cols = 16, rows = 14, px: CGFloat = 2
     var t = 0.0
     var colors = mochiGoo { didSet { layer?.shadowColor = colors.body.cgColor } }
-    var thinking = false
-    var processing = false
+    var thinking = false { didSet { if thinking && !oldValue && !processing { thinkingVisibility.reset() } } }
+    var processing = false { didSet { if processing && !oldValue && !thinking { thinkingVisibility.reset() } } }
+    var thinkingVisibility = ThinkingVisibility()
+    var idleThoughtThinking = IdleThoughtThinking()
+    var pendingHappy = false
     var asking = false                   // Claude asked a question: a little "?" over its head
     var fed = 0                          // messages sent today: a little rounder with each
     var hopT = -10.0, hops = 1
@@ -1433,7 +1511,9 @@ final class Goo: NSView {
     var catPetStart: Double? = nil
     var look = 0.0, lookTo = 0.0, lookY = 0, nextLook = 4.0, greetUntil = -10.0
     var lastActive = 0.0, sleepSince: Double? = nil
+    var automaticSleepDeferredUntil: Date?
     var hoverSince: Double? = nil
+    var onInteraction: (() -> Void)?
     var timer: Timer?
 
     // for testing the outfits: PB_HOUR=8 or PB_WEEKDAY=6 (Friday) in the environment
@@ -1454,8 +1534,27 @@ final class Goo: NSView {
     // things that happen to it
     func hop(_ n: Int = 1) { hopT = t; hops = n; wake() }
     func proud() { hop(2); sparkT = t; happy() }
-    func happy() { catHappyStart = catTime; wake() }
-    func worry() { worryT = t; catConfusedStart = catTime; leanV += 1.2; wake() }
+    func happy() {
+        wake()
+        // A completion can arrive before the next draw or during the brief visible Thinking hold.
+        if thinking || processing { return }
+        if thinkingVisibility.isHolding(at: t) || t - worryT < 1.4 {
+            pendingHappy = true
+        } else { catHappyStart = catTime }
+    }
+    func worry() {
+        thinkingVisibility.reset(); pendingHappy = false
+        // Several errors in one burst retain the current one-shot instead of restarting at idle_01.
+        if catTime - catConfusedStart >= 1.4 {
+            worryT = t; catConfusedStart = catTime; leanV += 1.2
+        }
+        wake()
+    }
+    func cancelThinking() { thinkingVisibility.reset(); pendingHappy = false }
+    func setIdleThoughtVisible(_ visible: Bool) {
+        idleThoughtThinking.setVisible(visible, at: catTime)
+        needsDisplay = true
+    }
     func wave() { wake(); catWaveStart = catTime }
     func throwIt() { throwT = t; wake() }
     func fling(_ vx: Double) { leanV += max(-2.2, min(2.2, -vx / 500)); wake() }
@@ -1498,7 +1597,7 @@ final class Goo: NSView {
 
         // hovering: a happy wiggle, then petting, then a heart
         if over {
-            if hoverSince == nil { hoverSince = t; leanV += 0.8 }
+            if hoverSince == nil { hoverSince = t; leanV += 0.8; onInteraction?() }
             wake()
             if t - hoverSince! > 2.2 && t - heartT > 2.6 { heartT = t }
         } else { hoverSince = nil }
@@ -1511,7 +1610,10 @@ final class Goo: NSView {
 
         // melts into a sleepy puddle after a quiet spell (sooner late at night)
         if thinking || processing || asking { wake() }
-        if sleepSince == nil && t - lastActive > (night ? 60 : 300) { sleepSince = t }
+        if sleepSince == nil && EdenAutoSleep.shouldSleep(inactiveFor: t - lastActive, night: night,
+                                                          now: Date(), deferredUntil: automaticSleepDeferredUntil) {
+            sleepSince = t
+        }
         switch env["PB_MOOD"] {
         case "sleepy": if !thinking && !processing && !asking && !over && sleepSince == nil { sleepSince = t - 2 }
         case "pet": if t - heartT > 2.6 { heartT = t }
@@ -1525,15 +1627,32 @@ final class Goo: NSView {
     var petting: Bool { if env["PB_MOOD"] == "pet" { return true }; if let h = hoverSince { return t - h > 0.6 } else { return false } }
 
     private func drawCat() {
+        let confusedAge = catTime - catConfusedStart
+        let warningActive = t - worryT < 1.4
+        let canDrawThinking = !sleeping && !asking && confusedAge >= 1.0 && !warningActive &&
+            !isHidden && window?.isVisible == true
+        let showThinking = thinkingVisibility.update(now: t, phaseTime: catTime,
+                                                     requested: thinking || processing,
+                                                     canDraw: canDrawThinking)
+        let showIdleThoughtThinking = idleThoughtThinking.shouldRender(
+            realProcessing: thinking || processing || showThinking, canDraw: canDrawThinking,
+            petting: petting, waveAge: catTime - catWaveStart, happyAge: catTime - catHappyStart)
+        if pendingHappy && !showThinking && !thinking && !processing && !warningActive && confusedAge >= 1.0 {
+            pendingHappy = false
+            catHappyStart = catTime
+        }
         let frame = EdenAnimation.select(catTime: catTime,
                                          sleepAge: sleepSince.map { max(0, t - $0) },
-                                         thinking: thinking || processing, asking: asking,
-                                         petting: petting, worried: t - worryT < 1.4,
+                                         thinking: showThinking || showIdleThoughtThinking, asking: asking,
+                                         petting: petting, worried: warningActive,
                                          happyAge: catTime - catHappyStart,
                                          blinkAge: catTime - catBlinkStart,
                                          waveAge: catTime - catWaveStart,
                                          pettingAge: catPetStart.map { catTime - $0 } ?? -1,
-                                         confusedAge: catTime - catConfusedStart)
+                                         confusedAge: confusedAge,
+                                         thinkingAge: showIdleThoughtThinking
+                                            ? idleThoughtThinking.frameAge(at: catTime)
+                                            : thinkingVisibility.frameAge(at: catTime))
         guard let image = CatSprites.image(for: frame) else {
             let label = "Eden art\nmissing" as NSString
             label.draw(in: bounds.insetBy(dx: 2, dy: 2), withAttributes: [
@@ -1922,6 +2041,170 @@ final class Wave: NSView {
     }
 }
 
+struct IdleThoughtsDialogue: Decodable {
+    struct Category: Decodable {
+        let id: String
+        let lines: [String]
+    }
+    let categories: [Category]
+
+    static func load(from url: URL?) -> IdleThoughtsDialogue? {
+        guard let url, let data = try? Data(contentsOf: url),
+              let dialogue = try? JSONDecoder().decode(Self.self, from: data),
+              !dialogue.categories.isEmpty else { return nil }
+        var ids = Set<String>(), lines = Set<String>()
+        for category in dialogue.categories {
+            guard !category.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  ids.insert(category.id).inserted, !category.lines.isEmpty else { return nil }
+            for line in category.lines {
+                let clean = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !clean.isEmpty, clean == line, lines.insert(clean).inserted else { return nil }
+            }
+        }
+        return dialogue
+    }
+}
+
+struct IdleThoughtsScheduler {
+    let dialogue: IdleThoughtsDialogue
+    private(set) var nextDue: Date?
+    private(set) var secondDue: Date?
+    private(set) var thoughtsShown = 0
+    private(set) var recent: [String] = []
+    private(set) var lastCategory: String?
+    private(set) var displayDeadline: Date?
+
+    static let displayDuration: TimeInterval = 4
+    static func randomFirstDelay() -> TimeInterval { Double.random(in: 120...240) }
+    static func randomSecondDelay() -> TimeInterval { Double.random(in: 360...540) }
+
+    mutating func pause() {
+        nextDue = nil; secondDue = nil; thoughtsShown = 0; displayDeadline = nil
+    }
+
+    mutating func restartAfterInteraction() { pause() }
+
+    mutating func completeDisplay() { displayDeadline = nil }
+
+    func sleepDeferralDeadline(at now: Date, enabled: Bool, eligible: Bool) -> Date? {
+        guard enabled, eligible else { return nil }
+        if let displayDeadline, now < displayDeadline { return displayDeadline }
+        guard thoughtsShown < 2, let nextDue else { return nil }
+        // The one-second scheduler and four-second bubble get bounded headroom.
+        let limit = nextDue.addingTimeInterval(8)
+        return now < limit ? limit : nil
+    }
+
+    mutating func tick(at now: Date, eligible: Bool,
+                       firstDelay: () -> TimeInterval = { IdleThoughtsScheduler.randomFirstDelay() },
+                       secondDelay: () -> TimeInterval = { IdleThoughtsScheduler.randomSecondDelay() }) -> String? {
+        guard eligible else { pause(); return nil }
+        guard thoughtsShown < 2 else { return nil }
+        guard let due = nextDue else {
+            nextDue = now.addingTimeInterval(firstDelay())
+            secondDue = now.addingTimeInterval(secondDelay())
+            return nil
+        }
+        guard now >= due else { return nil }
+        // A stalled timer or interrupted eligibility must not deliver an overdue thought.
+        guard now < due.addingTimeInterval(8) else { pause(); return nil }
+        let pool = dialogue.categories.flatMap(\.lines)
+        let recentLimit = min(10, max(0, pool.count - 1))
+        let available = dialogue.categories.compactMap { category -> (String, [String])? in
+            let choices = category.lines.filter { !recent.contains($0) }
+            return choices.isEmpty ? nil : (category.id, choices)
+        }
+        let different = available.filter { $0.0 != lastCategory }
+        let choices = different.isEmpty ? available : different
+        guard let category = choices.randomElement(), let line = category.1.randomElement() else {
+            pause(); return nil
+        }
+        lastCategory = category.0
+        thoughtsShown += 1
+        displayDeadline = now.addingTimeInterval(Self.displayDuration + 1)
+        recent.append(line)
+        if recent.count > recentLimit { recent.removeFirst(recent.count - recentLimit) }
+        nextDue = thoughtsShown == 1 ? secondDue : nil
+        return line
+    }
+}
+
+struct PettingDialogue: Decodable {
+    let lines: [String]
+
+    static func load(from url: URL?) -> PettingDialogue? {
+        guard let url, let data = try? Data(contentsOf: url),
+              let dialogue = try? JSONDecoder().decode(Self.self, from: data),
+              !dialogue.lines.isEmpty else { return nil }
+        var unique = Set<String>()
+        for line in dialogue.lines {
+            let clean = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty, clean == line, unique.insert(clean).inserted else { return nil }
+        }
+        return dialogue
+    }
+}
+
+struct PettingDialogueScheduler {
+    let dialogue: PettingDialogue
+    private(set) var recent: [String] = []
+    private(set) var nextAllowed: Date?
+    private(set) var seenHoverStart: Double?
+
+    static let requiredHover: Double = 2.2
+    static let displayDuration: TimeInterval = 4
+    static func randomCooldown() -> TimeInterval { Double.random(in: 30...60) }
+
+    mutating func observe(now: Date, hoverStart: Double?, hoverAge: Double,
+                          enabled: Bool, eligible: Bool,
+                          cooldown: () -> TimeInterval = { randomCooldown() },
+                          choose: (Int) -> Int = { Int.random(in: 0..<$0) }) -> String? {
+        guard let hoverStart else { seenHoverStart = nil; return nil }
+        guard hoverAge >= Self.requiredHover, seenHoverStart != hoverStart else { return nil }
+        // One opportunity per hover, even if another bubble or the cooldown blocks it.
+        seenHoverStart = hoverStart
+        guard enabled, eligible, nextAllowed.map({ now >= $0 }) ?? true else { return nil }
+        let choices = dialogue.lines.filter { !recent.contains($0) }
+        guard !choices.isEmpty else { return nil }
+        let line = choices[choose(choices.count)]
+        recent.append(line)
+        if recent.count > 5 { recent.removeFirst(recent.count - 5) }
+        nextAllowed = now.addingTimeInterval(cooldown())
+        return line
+    }
+}
+
+enum BubblePriority {
+    case idleThought, petting, provider, feedback
+    var rank: Int {
+        switch self {
+        case .idleThought: return 0
+        case .petting: return 1
+        case .provider, .feedback: return 2 // Keep existing replacement behaviour for important messages.
+        }
+    }
+}
+
+struct BubbleCoordinator {
+    private(set) var generation = 0
+    private(set) var priority: BubblePriority?
+
+    mutating func offer(_ incoming: BubblePriority) -> Int? {
+        if let priority, incoming.rank < priority.rank { return nil }
+        generation += 1
+        priority = incoming
+        return generation
+    }
+
+    // Return the generation after dismissal for a guarded fade completion.
+    mutating func dismiss(ifGeneration expected: Int? = nil) -> Int? {
+        guard priority != nil, expected.map({ $0 == generation }) ?? true else { return nil }
+        generation += 1
+        priority = nil
+        return generation
+    }
+}
+
 final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchFieldDelegate, NSTextViewDelegate, NSWindowDelegate, NSGestureRecognizerDelegate, NSMenuDelegate {
     var provider = ProviderID(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .claude
     var pillProviderMenu: NSMenu?
@@ -2022,6 +2305,20 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     private var quickCountGeneration = 0
     var lastApp: NSRunningApplication?
     var open = false
+    private let idleThoughtsKey = "idleThoughtsEnabled"
+    private var idleThoughtsEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: idleThoughtsKey) == nil || UserDefaults.standard.bool(forKey: idleThoughtsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: idleThoughtsKey) }
+    }
+    private var idleThoughts: IdleThoughtsScheduler?
+    private var idleThoughtVisible = false
+    private let pettingDialogueKey = "pettingDialogueEnabled"
+    private var pettingDialogueEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: pettingDialogueKey) == nil || UserDefaults.standard.bool(forKey: pettingDialogueKey) }
+        set { UserDefaults.standard.set(newValue, forKey: pettingDialogueKey) }
+    }
+    private var pettingDialogue: PettingDialogueScheduler?
+    private var bubbleCoordinator = BubbleCoordinator()
 
     // summary bubble that pops up above the bar when Claude finishes a reply (fed by notify.py, a Claude Code Stop hook)
     var bubble: Panel!
@@ -2135,8 +2432,13 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
         petHandle = PetHandle(frame: NSRect(x: 0, y: 0, width: w, height: h))
         petHandle.onClick = { [weak self] in self?.catClicked() }
+        petHandle.onInteraction = { [weak self] in
+            self?.dismissCasualDialogue(interaction: true)
+            self?.dot.wake()
+        }
         ring.addSubview(petHandle)
         dot = Goo(frame: NSRect(x: 0, y: 0, width: 84, height: 80))
+        dot.onInteraction = { [weak self] in self?.dismissCasualDialogue(interaction: true) }
         ring.addSubview(dot)
         let d = UserDefaults.standard, today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
         dot.fed = d.double(forKey: "fedDay") == today ? d.integer(forKey: "fed") : 0
@@ -2279,12 +2581,26 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         makeStatusItem()
 
         makeBubble()
+        let dialogueURL = Bundle.main.url(forResource: "IdleThoughts", withExtension: "json")
+        if let dialogue = IdleThoughtsDialogue.load(from: dialogueURL) {
+            idleThoughts = IdleThoughtsScheduler(dialogue: dialogue)
+        } else {
+            NSLog("Eden Idle Thoughts: dialogue resource unavailable or invalid")
+        }
+        let pettingURL = Bundle.main.url(forResource: "PettingDialogue", withExtension: "json")
+        if let dialogue = PettingDialogue.load(from: pettingURL) {
+            pettingDialogue = PettingDialogueScheduler(dialogue: dialogue)
+        } else {
+            NSLog("Eden Petting Dialogue: dialogue resource unavailable or invalid")
+        }
         reportPetArtwork()
         lastSeen = modified()   // don't pop up an old reply at launch
         if let d = try? Data(contentsOf: progressFile), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { progressSeen = j["text"] as? String ?? "" }
         if let d = try? Data(contentsOf: questionFile), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let id = j["id"] as? String, Date().timeIntervalSince1970 - (j["time"] as? Double ?? 0) > 1800 { qShownId = id }   // a stale question
         reloadTodos(announce: false)
         Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in self?.checkReply() }
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkIdleThoughts() }
+        Timer.scheduledTimer(withTimeInterval: 1.0/12, repeats: true) { [weak self] _ in self?.checkPettingDialogue() }
 
         lastMidX = panel.frame.midX
 
@@ -2390,7 +2706,107 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         m.addItem(login)
+        let thoughts = NSMenuItem(title: "Idle Thoughts", action: #selector(toggleIdleThoughts(_:)), keyEquivalent: "")
+        thoughts.target = self
+        thoughts.state = idleThoughtsEnabled ? .on : .off
+        m.addItem(thoughts)
+        let petting = NSMenuItem(title: "Petting Dialogue", action: #selector(togglePettingDialogue(_:)), keyEquivalent: "")
+        petting.target = self
+        petting.state = pettingDialogueEnabled ? .on : .off
+        m.addItem(petting)
         return m
+    }
+
+    @objc private func togglePettingDialogue(_ item: NSMenuItem) {
+        pettingDialogueEnabled.toggle()
+        item.state = pettingDialogueEnabled ? .on : .off
+        if !pettingDialogueEnabled { dismissCasualDialogue() }
+    }
+
+    private func dismissCasualDialogue(interaction: Bool = false) {
+        pauseIdleThoughts(interaction: interaction)
+        if bubbleCoordinator.priority == .petting { hideBubble() }
+    }
+
+    @objc private func toggleIdleThoughts(_ item: NSMenuItem) {
+        idleThoughtsEnabled.toggle()
+        item.state = idleThoughtsEnabled ? .on : .off
+        pauseIdleThoughts(interaction: true)
+        dot.wake()
+    }
+
+    private func pauseIdleThoughts(interaction: Bool = false) {
+        if interaction { idleThoughts?.restartAfterInteraction() }
+        else { idleThoughts?.pause() }
+        dot.automaticSleepDeferredUntil = nil
+        dot.setIdleThoughtVisible(false)
+        guard idleThoughtVisible else { return }
+        idleThoughts?.completeDisplay()
+        idleThoughtVisible = false
+        hideWork?.cancel()
+        _ = bubbleCoordinator.dismiss()
+        bubble?.orderOut(nil)
+        bubble?.ignoresMouseEvents = false
+    }
+
+    private func checkPettingDialogue() {
+        guard var scheduler = pettingDialogue else { return }
+        let hoverStart = dot.hoverSince
+        let eligible = panel.isVisible && !dot.sleeping && !open && !chatPanel.isVisible &&
+            !petHandle.isInteracting &&
+            !sending && !launcherInProgress && !guidedMessage.isActive && quickFlow.state == .home &&
+            !dot.thinking && !dot.processing && !dot.asking && dot.t - dot.worryT >= 1.4 &&
+            dot.catTime - dot.catConfusedStart >= 1.0 &&
+            qPanel?.isVisible != true && todoPanel?.isVisible != true && nowPanel?.isVisible != true &&
+            codexTurnID == nil && !codexStarting && !codexAwaitingTurnAck &&
+            (bubbleCoordinator.priority == nil || bubbleCoordinator.priority == .idleThought)
+        let line = scheduler.observe(now: Date(), hoverStart: hoverStart,
+                                     hoverAge: hoverStart.map { dot.t - $0 } ?? 0,
+                                     enabled: pettingDialogueEnabled, eligible: eligible)
+        pettingDialogue = scheduler
+        if let line { _ = showBubble(line, project: "a little purr", react: false, priority: .petting,
+                                    duration: PettingDialogueScheduler.displayDuration) }
+    }
+
+    private func checkIdleThoughts() {
+        guard var scheduler = idleThoughts else {
+            dot.automaticSleepDeferredUntil = nil
+            return
+        }
+        let now = Date()
+        let animating = dot.catTime - dot.catHappyStart < 0.8 ||
+            dot.catTime - dot.catWaveStart < 0.8 ||
+            dot.catTime - dot.catConfusedStart < 1.0 || dot.t < dot.greetUntil
+        let eligible = idleThoughtsEnabled && panel.isVisible && !dot.sleeping &&
+            !open && chatPanel.isVisible == false && !sending && !launcherInProgress &&
+            !guidedMessage.isActive && quickFlow.state == .home &&
+            !dot.thinking && !dot.processing && !dot.asking && !dot.petting &&
+            dot.hoverSince == nil && !animating &&
+            qPanel?.isVisible != true && todoPanel?.isVisible != true &&
+            nowPanel?.isVisible != true && codexTurnID == nil && !codexStarting &&
+            !codexAwaitingTurnAck && (bubble.isVisible == false || idleThoughtVisible)
+        if idleThoughtVisible {
+            if !eligible { pauseIdleThoughts() }
+            else { dot.automaticSleepDeferredUntil = scheduler.sleepDeferralDeadline(at: now,
+                                                                                      enabled: idleThoughtsEnabled,
+                                                                                      eligible: true) }
+            return
+        }
+        let line = scheduler.tick(at: now, eligible: eligible)
+        idleThoughts = scheduler
+        dot.automaticSleepDeferredUntil = scheduler.sleepDeferralDeadline(at: now,
+                                                                          enabled: idleThoughtsEnabled,
+                                                                          eligible: eligible)
+        guard let line else { return }
+        guard showBubble(line, project: "a little thought", react: false,
+                         priority: .idleThought, duration: IdleThoughtsScheduler.displayDuration) else {
+            idleThoughts?.pause()
+            dot.automaticSleepDeferredUntil = nil
+            return
+        }
+        idleThoughtVisible = true
+        dot.setIdleThoughtVisible(true)
+        bubble.ignoresMouseEvents = true
     }
 
     func makeProviderMenu() -> NSMenu {
@@ -2540,6 +2956,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     // A separate, consented history surface. It never changes the Terminal destination.
     @objc func browseCodexThreads() {
+        pauseIdleThoughts(interaction: true)
         if !UserDefaults.standard.bool(forKey: "codexHistoryConsent") {
             let alert = NSAlert()
             alert.messageText = "Browse local Codex threads?"
@@ -3311,18 +3728,22 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 let listing = QuickWindowSwitcher.windows(for: pid)
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.sending = false; self.dot.processing = false
-                    guard self.quickFlow.state == .selecting(.switchTo),
-                          let running = self.runningCopy(of: target.app, preferredPID: pid) else { return }
+                    guard self.quickFlow.state == .selecting(.switchTo) else {
+                        self.sending = false; self.dot.processing = false; self.dot.cancelThinking(); return
+                    }
+                    guard let running = self.runningCopy(of: target.app, preferredPID: pid) else {
+                        self.finishQuickWindowSwitch(.failed, "\(target.app.displayName) isn't running"); return
+                    }
                     self.quickSwitchTarget = (target.app, pid)
                     self.quickAppSearch = self.quickSearch.stringValue
                     self.quickSearch.stringValue = ""
                     switch listing {
                     case .available(let windows) where windows.count == 1:
                         if QuickWindowSwitcher.activate(windows[0], in: running) {
-                            self.finishQuickWindowSwitch(true, "Switched to \(target.app.displayName)")
+                            self.finishQuickWindowSwitch(.succeeded, "Switched to \(target.app.displayName)")
                             return
                         }
+                        self.dot.worry()
                         self.quickWindowTargets = []
                         self.quickWindowFallback = "Eden couldn't confirm that window is available. You can activate the app normally."
                     case .available(let windows) where windows.count > 1:
@@ -3335,6 +3756,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                         self.quickWindowTargets = []
                         self.quickWindowFallback = reason + " You can activate the app normally."
                     }
+                    self.sending = false; self.dot.processing = false; self.dot.cancelThinking()
                     self.quickFlow.selectWindow()
                     self.refreshQuickActions()
                     if self.quickWindowFallback == nil { self.chatPanel.makeFirstResponder(self.quickSearch) }
@@ -3342,47 +3764,48 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             }
             return
         }
-        sending = true; dot.processing = true
-        performAppAction(appAction, on: target.app, preferredPID: target.pid) { [weak self] success, message in
+        sending = true; dot.processing = action != .quit
+        performAppAction(appAction, on: target.app, preferredPID: target.pid) { [weak self] outcome, message in
             guard let self else { return }
-            self.sending = false; self.dot.processing = false
-            if success { self.dot.happy(); self.quickFlow.back(); self.refreshQuickActions() }
-            else { self.dot.worry(); self.renderQuickList() }
-            self.showBubble(message + (success ? "." : ". Your draft is still here."), project: "Eden", react: false)
+            self.sending = false; self.finishDesktopActionAnimation(outcome)
+            if outcome.isSuccess { self.quickFlow.back(); self.refreshQuickActions() }
+            else {
+                self.renderQuickList()
+            }
+            self.showBubble(message + (outcome.isSuccess ? "." : ". Your draft is still here."), project: "Eden", react: false)
         }
     }
 
-    private func finishQuickWindowSwitch(_ success: Bool, _ message: String) {
-        sending = false; dot.processing = false
-        if success {
-            dot.happy(); quickFlow.cancel()
+    private func finishQuickWindowSwitch(_ outcome: DesktopActionOutcome, _ message: String) {
+        sending = false; finishDesktopActionAnimation(outcome)
+        if outcome.isSuccess {
+            quickFlow.cancel()
             quickSwitchTarget = nil; quickWindowTargets = []; quickWindowFallback = nil
             refreshQuickActions()
         } else {
-            dot.worry()
             if quickFlow.state == .selectingWindow { renderQuickWindowList() }
         }
-        showBubble(message + (success ? "." : ". Your draft is still here."), project: "Eden", react: false)
+        showBubble(message + (outcome.isSuccess ? "." : ". Your draft is still here."), project: "Eden", react: false)
     }
 
     @objc private func chooseQuickWindow(_ sender: NSButton) {
         guard quickFlow.state == .selectingWindow, quickWindowTargets.indices.contains(sender.tag),
               let target = quickSwitchTarget, !sending else { return }
         guard let running = runningCopy(of: target.app, preferredPID: target.pid) else {
-            finishQuickWindowSwitch(false, "\(target.app.displayName) isn't running")
+            finishQuickWindowSwitch(.failed, "\(target.app.displayName) isn't running")
             return
         }
         let window = quickWindowTargets[sender.tag]
         let success = QuickWindowSwitcher.activate(window, in: running)
-        finishQuickWindowSwitch(success, success ? "Switched to \(target.app.displayName): \(window.title.isEmpty ? "Untitled window" : window.title)"
+        finishQuickWindowSwitch(success ? .succeeded : .failed, success ? "Switched to \(target.app.displayName): \(window.title.isEmpty ? "Untitled window" : window.title)"
                                          : "That window is no longer available or couldn't be focused")
     }
 
     @objc private func activateQuickAppNormally() {
         guard quickFlow.state == .selectingWindow, let target = quickSwitchTarget, !sending else { return }
         sending = true; dot.processing = true
-        performAppAction(.switchTo, on: target.app, preferredPID: target.pid) { [weak self] success, message in
-            self?.finishQuickWindowSwitch(success, success
+        performAppAction(.switchTo, on: target.app, preferredPID: target.pid) { [weak self] outcome, message in
+            self?.finishQuickWindowSwitch(outcome, outcome.isSuccess
                 ? "Activated \(target.app.displayName) normally; no window was selected" : message)
         }
     }
@@ -3408,6 +3831,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     // Show chat beside the fixed pet window; never resize or move the pet for a toggle.
     func setOpen(_ o: Bool) {
         note("setOpen \(o)")
+        if o { pauseIdleThoughts(interaction: true); dot.wake() }
         guard o != open else { return }
         open = o
         if o {
@@ -3487,6 +3911,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         let wm = (try? FileManager.default.attributesOfItem(atPath: workFile.path))?[.modificationDate] as? Date
         let lm = modified()
         dot.thinking = wm != nil && (lm == nil || wm! > lm!) && Date().timeIntervalSince(wm!) < 1800
+        if dot.thinking && idleThoughtVisible { pauseIdleThoughts() }
         let newest = (wm ?? .distantPast) > (lm ?? .distantPast) ? workFile : lastFile
         if let d = try? Data(contentsOf: newest), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let p = (j["project"] as? String)?.lowercased() {
             _ = p; dot.colors = mochiGoo
@@ -3512,7 +3937,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         // what Claude says while it works (not just when it's done)
         if let said = prog["text"] as? String, !said.isEmpty, said != progressSeen {
             progressSeen = said
-            if qPanel?.isVisible != true { showBubble(said, project: (prog["project"] as? String ?? "") + " · working", react: false, full: said); dot.hop() }
+            if qPanel?.isVisible != true { showBubble(said, project: (prog["project"] as? String ?? "") + " · working", react: false, full: said, priority: .provider); dot.hop() }
         }
 
         // a question from Claude
@@ -3528,7 +3953,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let text = j["text"] as? String, !text.isEmpty else { return }
         progressSeen = ""
-        showBubble(text, project: j["project"] as? String ?? "", full: j["full"] as? String)
+        showBubble(text, project: j["project"] as? String ?? "", full: j["full"] as? String, priority: .provider)
     }
 
     func checkTodosAndNudge() {
@@ -3545,7 +3970,12 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     }
 
-    func showBubble(_ text: String, project: String, react: Bool = true, full: String? = nil) {
+    @discardableResult
+    func showBubble(_ text: String, project: String, react: Bool = true, full: String? = nil,
+                    priority: BubblePriority = .feedback, duration: TimeInterval? = nil) -> Bool {
+        if idleThoughtVisible && priority != .idleThought { pauseIdleThoughts() }
+        guard let generation = bubbleCoordinator.offer(priority) else { return false }
+        bubble.ignoresMouseEvents = false
         note("bubble shown")
         // the goo reacts: a proud double hop with sparkles when something went live, otherwise a hop
         if react {
@@ -3569,15 +3999,21 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             bubble.animator().alphaValue = 1
             bubble.animator().setFrame(to, display: true)
         }
-        armHide(pages.count > 1 ? 16 : 5 + Double(body.count) / 25)
+        armHide(duration ?? (pages.count > 1 ? 16 : 5 + Double(body.count) / 25), generation: generation)
+        return true
     }
 
     // hide after a while, but never while the mouse is resting on it
-    func armHide(_ secs: Double) {
+    func armHide(_ secs: Double, generation: Int? = nil) {
         hideWork?.cancel()
+        let expected = generation ?? bubbleCoordinator.generation
         let w = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            if NSMouseInRect(NSEvent.mouseLocation, self.bubble.frame, false) { self.armHide(3) } else { self.hideBubble() }
+            guard self.bubbleCoordinator.generation == expected else { return }
+            if self.bubbleCoordinator.priority == .idleThought { self.hideBubbleIfCurrent(expected); return }
+            if NSMouseInRect(NSEvent.mouseLocation, self.bubble.frame, false) {
+                self.armHide(3, generation: expected)
+            } else { self.hideBubbleIfCurrent(expected) }
         }
         hideWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + secs, execute: w)
@@ -3644,21 +4080,43 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         if let v = panel.screen?.visibleFrame {
             r.origin.x = min(max(r.minX, v.minX + 8), v.maxX - size.width - 8)
             if r.maxY > v.maxY { r.origin.y = f.minY - 10 - size.height }   // no room above: go below
+            r.origin.y = min(max(r.minY, v.minY + 8), max(v.minY + 8, v.maxY - size.height - 8))
         }
         p.setFrame(r, display: true)
     }
     func placeBubble(_ size: NSSize? = nil) { placeAbove(bubble, size ?? bubble.frame.size) }
 
-    @objc func hideBubble() {
+    @objc func hideBubble() { hideBubbleIfCurrent(nil) }
+
+    private func hideBubbleIfCurrent(_ expected: Int?) {
+        guard let dismissedGeneration = bubbleCoordinator.dismiss(ifGeneration: expected) else { return }
         hideWork?.cancel()
+        if idleThoughtVisible {
+            idleThoughts?.completeDisplay()
+            dot.automaticSleepDeferredUntil = nil
+            idleThoughtVisible = false
+            dot.setIdleThoughtVisible(false)
+            bubble.ignoresMouseEvents = false
+            bubble.orderOut(nil)
+            bubble.alphaValue = 1
+            return
+        }
+        idleThoughtVisible = false
+        dot.setIdleThoughtVisible(false)
+        bubble.ignoresMouseEvents = false
         NSAnimationContext.runAnimationGroup({ c in
             c.duration = 0.3; bubble.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in self?.bubble.orderOut(nil) })
+        }, completionHandler: { [weak self] in
+            guard let self, self.bubbleCoordinator.generation == dismissedGeneration else { return }
+            self.bubble.orderOut(nil)
+        })
     }
 
     // the bubble follows the bar when it's dragged or resized
     func windowDidMove(_ n: Notification) {
         guard n.object as? NSWindow === panel else { return }
+        pauseIdleThoughts(interaction: true)
+        dot.wake()
         UserDefaults.standard.set(["x": Double(panel.frame.minX), "y": Double(panel.frame.minY)],
                                   forKey: "edenPetPosition")
         positionChat()
@@ -4077,7 +4535,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             codexActivity = "Codex completed"
             updateDestinationDisplay()
             if !codexFinalText.isEmpty {
-                showBubble(codexFinalText, project: thread.title, react: false)
+                showBubble(codexFinalText, project: thread.title, react: false, priority: .provider)
             } else { flash("Codex completed; view reply in Codex") }
         } else {
             markCodexDiagnostic(stage: "turn completed", method: "turn/completed",
@@ -4198,6 +4656,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     }
 
     func send() {
+        pauseIdleThoughts(interaction: true)
+        dot.wake()
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending, !launcherInProgress else { return }
         if let destination = GuidedMessageIntentParser().parse(text) {
@@ -4307,6 +4767,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         pasteboard.clearContents()
         guard pasteboard.setString(draft, forType: .string) else {
             restoreClipboard(pasteboard, items: previousItems, ifUnchanged: pasteboard.changeCount)
+            dot.worry()
             showBubble("Clipboard unavailable. Your draft is still here.", project: destination.name, react: false)
             return
         }
@@ -4327,6 +4788,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                                 project: destination.name, react: false)
             } else {
                 self.field.stringValue = draft
+                self.dot.worry()
                 self.showBubble("I couldn't open \(destination.name) or its website. Your draft is still here.",
                                 project: destination.name, react: false)
             }
@@ -4482,21 +4944,20 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         // A fresh discovery for every command includes newly installed apps.
         LauncherAppDiscovery.discover(names: names) { [weak self] catalog in
             self?.launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: 0,
-                                      results: [], allSucceeded: true)
+                                      results: [], outcome: .succeeded)
         }
     }
 
     private func launchRequestedApps(_ names: [String], action: DesktopAppAction, catalog: [InstalledApplication], draft: String,
-                                     index: Int, results: [String], allSucceeded: Bool) {
+                                     index: Int, results: [String], outcome: DesktopActionOutcome) {
         guard index < names.count else {
             sending = false
             launcherInProgress = false
-            dot.processing = false
-            if allSucceeded && field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == draft {
+            finishDesktopActionAnimation(outcome)
+            if outcome.isSuccess && field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) == draft {
                 field.stringValue = ""
             }
-            if allSucceeded { dot.happy() } else { dot.worry() }
-            showBubble(results.joined(separator: "; ") + (allSucceeded ? "." : ". Draft kept."),
+            showBubble(results.joined(separator: "; ") + (outcome.isSuccess ? "." : ". Draft kept."),
                        project: "apps", react: false)
             return
         }
@@ -4507,7 +4968,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         switch resolution {
         case .missing:
             launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: index + 1,
-                                results: results + ["Couldn't find \(name)"], allSucceeded: false)
+                                results: results + ["Couldn't find \(name)"], outcome: outcome.combined(with: .failed))
             return
         case .exact(let apps), .alias(let apps): matches = apps; approximate = false
         case .suggestions(let apps): matches = apps; approximate = true
@@ -4517,12 +4978,13 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         else { chosen = chooseLauncherApp(matches, for: name, approximate: approximate, action: action) }
         guard let app = chosen else {
             launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: index + 1,
-                                results: results + ["Skipped \(name)"], allSucceeded: false)
+                                results: results + ["Skipped \(name)"], outcome: outcome.combined(with: .cancelled))
             return
         }
-        performAppAction(action, on: app) { [weak self] success, description in
+        if action != .quit { dot.processing = true }
+        performAppAction(action, on: app) { [weak self] result, description in
             self?.launchRequestedApps(names, action: action, catalog: catalog, draft: draft, index: index + 1,
-                                      results: results + [description], allSucceeded: allSucceeded && success)
+                                      results: results + [description], outcome: outcome.combined(with: result))
         }
     }
 
@@ -4539,6 +5001,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         picker.addItems(withTitles: apps.map { "\($0.displayName) · \($0.url.path)" })
         for (index, app) in apps.enumerated() { picker.item(at: index)?.toolTip = "\(app.bundleID)\n\(app.url.path)" }
         alert.accessoryView = picker
+        dot.processing = false
+        dot.cancelThinking()
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn,
               apps.indices.contains(picker.indexOfSelectedItem) else { return nil }
@@ -4553,32 +5017,43 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         }
     }
 
+    private func finishDesktopActionAnimation(_ outcome: DesktopActionOutcome) {
+        dot.processing = false
+        switch outcome {
+        case .succeeded: dot.happy()
+        case .failed: dot.worry()
+        case .cancelled: dot.cancelThinking()
+        }
+    }
+
     private func performAppAction(_ action: DesktopAppAction, on app: InstalledApplication,
                                   preferredPID: pid_t? = nil,
-                                  completion: @escaping (Bool, String) -> Void) {
+                                  completion: @escaping (DesktopActionOutcome, String) -> Void) {
         guard let current = InstalledApplication(url: app.url), current.bundleID == app.bundleID else {
-            completion(false, "\(app.displayName) changed or is no longer available")
+            completion(.failed, "\(app.displayName) changed or is no longer available")
             return
         }
         switch action {
         case .open: launchInstalledApp(app, completion: completion)
         case .switchTo, .hide, .quit:
             guard let running = runningCopy(of: app, preferredPID: preferredPID) else {
-                completion(false, "\(app.displayName) isn't running")
+                completion(.failed, "\(app.displayName) isn't running")
                 return
             }
             guard running.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
-                completion(false, "Use Eden's menu to hide or quit Eden")
+                completion(.failed, "Use Eden's menu to hide or quit Eden")
                 return
             }
             switch action {
             case .switchTo:
                 let ok = running.activate(options: [.activateAllWindows])
-                completion(ok, ok ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
+                completion(ok ? .succeeded : .failed, ok ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
             case .hide:
                 let ok = running.hide()
-                completion(ok, ok ? "Hid \(app.displayName)" : "Couldn't hide \(app.displayName)")
+                completion(ok ? .succeeded : .failed, ok ? "Hid \(app.displayName)" : "Couldn't hide \(app.displayName)")
             case .quit:
+                dot.processing = false
+                dot.cancelThinking()
                 let alert = NSAlert()
                 alert.messageText = "Quit \(app.displayName)?"
                 alert.informativeText = "Unsaved work could be affected. \(app.displayName) may ask you to save before it quits. Eden will never force quit it."
@@ -4586,18 +5061,19 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 alert.addButton(withTitle: "Cancel")
                 NSApp.activate(ignoringOtherApps: true)
                 guard alert.runModal() == .alertFirstButtonReturn else {
-                    completion(false, "Cancelled quitting \(app.displayName)")
+                    completion(.cancelled, "Cancelled quitting \(app.displayName)")
                     return
                 }
+                dot.processing = true
                 guard running.terminate() else {
-                    completion(false, "Couldn't request \(app.displayName) to quit")
+                    completion(.failed, "Couldn't request \(app.displayName) to quit")
                     return
                 }
                 func checkQuit(_ attempts: Int) {
                     if running.isTerminated {
-                        completion(true, "Quit \(app.displayName)")
+                        completion(.succeeded, "Quit \(app.displayName)")
                     } else if attempts >= 20 {
-                        completion(false, "\(app.displayName) hasn't quit yet")
+                        completion(.failed, "\(app.displayName) hasn't quit yet")
                     } else {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { checkQuit(attempts + 1) }
                     }
@@ -4609,15 +5085,16 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     }
 
     private func launchInstalledApp(_ app: InstalledApplication,
-                                    completion: @escaping (Bool, String) -> Void) {
+                                    completion: @escaping (DesktopActionOutcome, String) -> Void) {
         guard let current = InstalledApplication(url: app.url), current.bundleID == app.bundleID else {
-            completion(false, "\(app.displayName) changed or is no longer available")
+            completion(.failed, "\(app.displayName) changed or is no longer available")
             return
         }
         let running = runningCopy(of: app)
         if let running {
             let activated = running.activate(options: [.activateAllWindows])
-            completion(activated, activated ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
+            completion(activated ? .succeeded : .failed,
+                       activated ? "Switched to \(app.displayName)" : "Couldn't switch to \(app.displayName)")
             return
         }
         let configuration = NSWorkspace.OpenConfiguration()
@@ -4626,7 +5103,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             DispatchQueue.main.async {
                 let verified = error == nil && launched?.bundleIdentifier == app.bundleID &&
                     launched?.bundleURL.map { LauncherAppDiscovery.sameLocation($0, app.url) } == true
-                completion(verified, verified ? "Opened \(app.displayName)" : "Couldn't verify opening \(app.displayName)")
+                completion(verified ? .succeeded : .failed,
+                           verified ? "Opened \(app.displayName)" : "Couldn't verify opening \(app.displayName)")
             }
         }
     }

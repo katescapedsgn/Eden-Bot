@@ -27,10 +27,12 @@ BUILD="$REPO/build"
 BUNDLE="$BUILD/Eden.app"
 APPS="$HOME/Applications"
 TARGET="$APPS/Eden.app"
-IDENTITY="Mochi Local Signing"
+IDENTITY="Eden Local Signing"
 BUNDLE_ID="io.github.jessawolfe.mochi"
 ICON_NAME="Eden.icns"
 ICON_SOURCE="$REPO/assets/branding/Eden.icns"
+DIALOGUE_SOURCE="$REPO/assets/dialogue/idle-thoughts.json"
+PETTING_DIALOGUE_SOURCE="$REPO/assets/dialogue/petting.json"
 PLIST_BUDDY="/usr/libexec/PlistBuddy"
 
 die() { echo "Eden: $*" >&2; exit 1; }
@@ -77,10 +79,22 @@ validate_cat_sprites() {
   [[ "$(find "$app/Contents/Resources/PetSprites/Eden" -type f -name '*.png' | wc -l | tr -d ' ')" == 23 ]]
 }
 
+validate_idle_thoughts() {
+  local bundled="$1/Contents/Resources/IdleThoughts.json"
+  [[ -s "$DIALOGUE_SOURCE" && -s "$bundled" ]] && cmp -s "$DIALOGUE_SOURCE" "$bundled"
+}
+
+validate_petting_dialogue() {
+  local bundled="$1/Contents/Resources/PettingDialogue.json"
+  [[ -s "$PETTING_DIALOGUE_SOURCE" && -s "$bundled" ]] && cmp -s "$PETTING_DIALOGUE_SOURCE" "$bundled"
+}
+
 command -v swiftc >/dev/null || die "swiftc is unavailable. Install Apple's Command Line Tools separately."
 [[ -f "$REPO/Sources/Mochi.swift" ]] || die "Swift source is missing."
 SDK="$(xcrun --show-sdk-path)" || die "Could not locate the active macOS SDK."
 [[ -f "$ICON_SOURCE" && -s "$ICON_SOURCE" ]] || die "Eden icon is missing or empty: $ICON_SOURCE"
+[[ -s "$DIALOGUE_SOURCE" ]] || die "Idle Thoughts dialogue is missing or empty: $DIALOGUE_SOURCE"
+[[ -s "$PETTING_DIALOGUE_SOURCE" ]] || die "Petting dialogue is missing or empty: $PETTING_DIALOGUE_SOURCE"
 sips -g format "$ICON_SOURCE" 2>/dev/null | grep -q 'format: icns' || die "Icon is not a valid .icns file: $ICON_SOURCE"
 [[ "$(find "$REPO/assets/sprites/eden" -type f -name '*.png' | wc -l | tr -d ' ')" == 23 ]] || die "Expected exactly 23 Eden animation sprites."
 while IFS= read -r RELATIVE; do
@@ -112,6 +126,8 @@ if ! swiftc -O -sdk "$SDK" -module-cache-path "$STAGE/module-cache" "$REPO/Sourc
 fi
 
 cp "$ICON_SOURCE" "$APP/Contents/Resources/$ICON_NAME"
+cp "$DIALOGUE_SOURCE" "$APP/Contents/Resources/IdleThoughts.json"
+cp "$PETTING_DIALOGUE_SOURCE" "$APP/Contents/Resources/PettingDialogue.json"
 while IFS= read -r RELATIVE; do
   DESTINATION="$APP/Contents/Resources/PetSprites/Eden/$RELATIVE"
   mkdir -p "$(dirname "$DESTINATION")"
@@ -137,6 +153,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 validate_bundle "$APP" || die "The built app bundle failed structural validation."
 validate_cat_sprites "$APP" || die "The built app bundle is missing pet sprites."
+validate_idle_thoughts "$APP" || die "The built app bundle is missing Idle Thoughts dialogue."
+validate_petting_dialogue "$APP" || die "The built app bundle is missing Petting Dialogue."
 [[ "$(plist_value "$APP" CFBundleIconFile)" == "$ICON_NAME" ]] || die "Built app icon reference is incorrect."
 cmp -s "$ICON_SOURCE" "$APP/Contents/Resources/$ICON_NAME" || die "Built app icon differs from assets/branding/Eden.icns."
 
@@ -148,11 +166,18 @@ if [[ "$AD_HOC" == true ]]; then
   codesign --force --sign - "$APP" || die "Ad hoc signing failed."
   codesign --verify --deep --strict "$APP" || die "Ad hoc signature verification failed."
   SIGNED=true
-elif security find-identity -v -p codesigning | grep -Fq "\"$IDENTITY\""; then
-  xattr -cr "$APP" || die "Could not remove extended attributes from the staged app."
-  codesign --force --sign "$IDENTITY" "$APP" || die "Signing failed for '$IDENTITY'. No ad hoc signature was used."
-  codesign --verify --deep --strict "$APP" || die "Code signature verification failed."
-  SIGNED=true
+else
+  IDENTITIES="$(security find-identity -v -p codesigning)" || die "Could not check code-signing identities in Keychain."
+  # Match the complete certificate name and sign by its hash, so a similarly
+  # named or duplicate certificate cannot silently be selected.
+  IDENTITY_HASHES="$(printf '%s\n' "$IDENTITIES" | sed -nE 's/^[[:space:]]*[0-9]+\)[[:space:]]+([[:xdigit:]]{40})[[:space:]]+"Eden Local Signing"[[:space:]]*$/\1/p')"
+  if [[ -n "$IDENTITY_HASHES" ]]; then
+    [[ "$(printf '%s\n' "$IDENTITY_HASHES" | wc -l | tr -d ' ')" == 1 ]] || die "Multiple valid '$IDENTITY' identities found. Remove the ambiguity in Keychain before signing."
+    xattr -cr "$APP" || die "Could not remove extended attributes from the staged app."
+    codesign --force --sign "$IDENTITY_HASHES" "$APP" || die "'$IDENTITY' could not sign the app. Check private-key access in Keychain; no other identity was substituted."
+    codesign --verify --deep --strict "$APP" || die "Code signature verification failed for '$IDENTITY'."
+    SIGNED=true
+  fi
 fi
 
 if [[ -e "$BUNDLE" || -L "$BUNDLE" ]]; then
@@ -165,6 +190,8 @@ fi
 mv "$APP" "$BUNDLE" || die "Could not place the built app in build/."
 validate_bundle "$BUNDLE" || die "Final build bundle failed validation."
 validate_cat_sprites "$BUNDLE" || die "Final build is missing pet sprites."
+validate_idle_thoughts "$BUNDLE" || die "Final build is missing Idle Thoughts dialogue."
+validate_petting_dialogue "$BUNDLE" || die "Final build is missing Petting Dialogue."
 [[ "$(plist_value "$BUNDLE" CFBundleIconFile)" == "$ICON_NAME" ]] || die "Final build icon reference is incorrect."
 cmp -s "$ICON_SOURCE" "$BUNDLE/Contents/Resources/$ICON_NAME" || die "Final build icon differs from assets/branding/Eden.icns."
 echo "Built and validated: $BUNDLE"
@@ -178,12 +205,12 @@ if [[ "$MODE" == "--build-only" ]]; then
   if [[ "$AD_HOC" == true ]]; then
     echo "Ad hoc signed build only. macOS may ask for Automation and Accessibility permission again after an update." >&2
   elif [[ "$SIGNED" == false ]]; then
-    echo "Unsigned build only: '$IDENTITY' is not a valid signing identity. Installation will refuse it." >&2
+    echo "Unsigned build only: no valid '$IDENTITY' code-signing identity with a private key was found. Installation will refuse it." >&2
   fi
   exit 0
 fi
 
-[[ "$SIGNED" == true ]] || die "Installation requires the existing '$IDENTITY' signing identity. The build was not installed."
+[[ "$SIGNED" == true ]] || die "Installation requires a valid '$IDENTITY' code-signing identity with an accessible private key. The build was not installed."
 codesign --verify --deep --strict "$BUNDLE" || die "Built app signature is invalid."
 if [[ "$AD_HOC" == true ]]; then
   echo "Ad hoc signing can reset macOS Automation and Accessibility grants across rebuilds." >&2
@@ -214,6 +241,8 @@ trap 'rm -rf "$INCOMING"; rm -rf "$STAGE"' EXIT
 ditto "$BUNDLE" "$INCOMING/Eden.app" || die "Could not stage the app in ~/Applications."
 validate_bundle "$INCOMING/Eden.app" || die "Staged app failed validation."
 validate_cat_sprites "$INCOMING/Eden.app" || die "Staged app is missing pet sprites."
+validate_idle_thoughts "$INCOMING/Eden.app" || die "Staged app is missing Idle Thoughts dialogue."
+validate_petting_dialogue "$INCOMING/Eden.app" || die "Staged app is missing Petting Dialogue."
 [[ "$(plist_value "$INCOMING/Eden.app" CFBundleIconFile)" == "$ICON_NAME" ]] || die "Staged app icon reference is incorrect."
 cmp -s "$ICON_SOURCE" "$INCOMING/Eden.app/Contents/Resources/$ICON_NAME" || die "Staged app icon differs from assets/branding/Eden.icns."
 codesign --verify --deep --strict "$INCOMING/Eden.app" || die "Staged app signature is invalid."

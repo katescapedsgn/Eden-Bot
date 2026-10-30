@@ -11,4 +11,5 @@ sed '/^let app = NSApplication.shared/,$d' "$repo/Sources/Mochi.swift" > "$scrat
 sdk="${KATESCAPE_TEST_SDK:-$(xcrun --show-sdk-path)}"
 swiftc -sdk "$sdk" -module-cache-path "$scratch/module-cache" \
     "$scratch/LauncherSource.swift" "$repo/tests/main.swift" -o "$scratch/launcher-tests"
-"$scratch/launcher-tests"
+EDEN_DIALOGUE_SOURCE="$repo/assets/dialogue/idle-thoughts.json" \
+EDEN_PETTING_SOURCE="$repo/assets/dialogue/petting.json" "$scratch/launcher-tests"

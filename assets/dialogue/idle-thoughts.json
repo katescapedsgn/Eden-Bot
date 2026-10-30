@@ -1,0 +1,89 @@
+{
+  "categories": [
+    {
+      "id": "catThoughts",
+      "lines": [
+        "That cursor has been following you all day.",
+        "I could sit there. I could sit anywhere.",
+        "Your keyboard is my heated throne.",
+        "I have a plan. It involves a box.",
+        "The mouse and I have unfinished business.",
+        "I inspected the desktop. Needs more cat.",
+        "Nine lives, one very long lunch break.",
+        "My whiskers say it's nearly snack time.",
+        "I was helping. You just couldn't tell.",
+        "The empty space is clearly for me.",
+        "I found a sunbeam. It's confidential.",
+        "I respect your files from a distance. Mostly."
+      ]
+    },
+    {
+      "id": "techGremlin",
+      "lines": [
+        "I chased a bug. It filed a complaint.",
+        "Have you tried turning me off? Rude.",
+        "Your tabs are breeding again.",
+        "I pressed nothing. It was already like that.",
+        "The Wi-Fi and I are on speaking terms.",
+        "I understand the cloud. It's a big sky.",
+        "My cache is full of imaginary biscuits.",
+        "I debugged a nap. It passed.",
+        "Your desktop has excellent climbing potential.",
+        "I asked the printer nicely. No reply.",
+        "The loading spinner is my rival.",
+        "I'm monitoring the pixels. They're restless."
+      ]
+    },
+    {
+      "id": "sleepyDramatic",
+      "lines": [
+        "I need a nap after considering a nap.",
+        "This is my most exhausting sitting position.",
+        "My diary says: rest, then recover.",
+        "I have been awake for several moments.",
+        "The blanket situation is deeply unfair.",
+        "I could do more, but what a tragedy.",
+        "My paws require a shorter working week.",
+        "I'm conserving energy for later lounging.",
+        "Please hold. My dreams need a minute.",
+        "Even my yawn needs a tea break.",
+        "I was born ready for bedtime.",
+        "A meeting? At this hour of the day?"
+      ]
+    },
+    {
+      "id": "fourthWall",
+      "lines": [
+        "I live on your screen. The rent is excellent.",
+        "Please don't minimise my ambitions.",
+        "I can see my own pixels. Very fashionable.",
+        "Somebody drew me. I chose mischief.",
+        "This rectangle has a strict cat policy.",
+        "I have no pockets, yet so many secrets.",
+        "My job title is tiny desktop presence.",
+        "I am two dimensions of trouble.",
+        "The edge of this window is my horizon.",
+        "You're looking at art with opinions.",
+        "I'm animated. My schedule is less so.",
+        "A pixel can dream, apparently."
+      ]
+    },
+    {
+      "id": "affectionate",
+      "lines": [
+        "I saved you a spot beside me. On the screen.",
+        "You may pet me when you've earned it.",
+        "I'm glad you're here. Keep it quiet.",
+        "Your company is acceptable. Very acceptable.",
+        "I approve of your continued existence here.",
+        "I missed you for almost a whole minute.",
+        "You're my favourite human at this desk.",
+        "I brought you a purr. It's invisible.",
+        "I would share my sunbeam with you. Briefly.",
+        "Your work is better with a cat nearby.",
+        "I trust you with the good chair.",
+        "You can stay. I checked."
+      ]
+    }
+  ]
+}
