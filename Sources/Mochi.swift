@@ -60,6 +60,78 @@ final class PetHandle: NSView {
     }
 }
 
+final class EdenButton: NSButton {
+    var compactQuickAction = false { didSet { updateThemeState() } }
+    private var hovered = false { didSet { updateThemeState() } }
+    private var pressed = false { didSet { updateThemeState() } }
+
+    override var isEnabled: Bool { didSet { updateThemeState() } }
+    override var acceptsFirstResponder: Bool { true }
+
+    func updateThemeState() {
+        let focused = window?.firstResponder === self
+        layer?.backgroundColor = (isEnabled ? EdenTheme.selected : EdenTheme.surface).cgColor
+        layer?.borderWidth = isEnabled ? (focused ? 2 : pressed || hovered ? 1 : compactQuickAction ? 0 : 1) : 0
+        let border = focused ? EdenTheme.focus : pressed || hovered ? EdenTheme.pressed : EdenTheme.primary
+        layer?.borderColor = border.cgColor
+        contentTintColor = isEnabled ? EdenTheme.text : EdenTheme.secondaryText
+        needsDisplay = true
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder(); updateThemeState(); return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder(); updateThemeState(); return resigned
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func mouseDown(with event: NSEvent) {
+        pressed = true
+        super.mouseDown(with: event)
+        pressed = false
+    }
+
+    func contentRects() -> (icon: NSRect?, title: NSRect) {
+        let font = self.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let titleSize = (title as NSString).size(withAttributes: [.font: font])
+        let iconSize: CGFloat = image == nil ? 0 : min(16, bounds.height - 10)
+        let gap: CGFloat = image == nil || title.isEmpty ? 0 : (compactQuickAction ? 8 : 5)
+        let titleWidth = min(titleSize.width, max(0, bounds.width - 16 - iconSize - gap))
+        let groupWidth = iconSize + gap + titleWidth
+        let x = bounds.midX - groupWidth / 2
+        let iconRect = image == nil ? nil : NSRect(x: x, y: bounds.midY - iconSize / 2,
+                                                  width: iconSize, height: iconSize)
+        let titleRect = NSRect(x: x + iconSize + gap, y: bounds.midY - titleSize.height / 2,
+                               width: titleWidth, height: titleSize.height)
+        return (iconRect, titleRect)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if isEnabled && !compactQuickAction { super.draw(dirtyRect); return }
+        let foreground = isEnabled ? EdenTheme.text : EdenTheme.secondaryText
+        (isEnabled ? EdenTheme.selected : EdenTheme.surface).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
+        let font = self.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = lineBreakMode
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: foreground,
+                                                          .paragraphStyle: paragraph]
+        let rects = contentRects()
+        if let image, let iconRect = rects.icon {
+            let symbol = image.withSymbolConfiguration(.init(paletteColors: [foreground])) ?? image
+            symbol.draw(in: iconRect)
+        }
+        (title as NSString).draw(in: rects.title, withAttributes: attributes)
+    }
+}
+
 final class QuickPickerRow: NSButton {
     private let nameLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
@@ -72,6 +144,7 @@ final class QuickPickerRow: NSButton {
         super.init(frame: .zero)
         self.title = ""
         isBordered = false
+        focusRingType = .none
         wantsLayer = true
         layer?.cornerRadius = 8
         toolTip = title
@@ -84,17 +157,18 @@ final class QuickPickerRow: NSButton {
         }
         nameLabel.stringValue = title
         nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        nameLabel.textColor = EdenTheme.text
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.frame = NSRect(x: icon == nil ? 12 : 44, y: 13,
                                  width: showsChevron ? 192 : 232, height: 20)
         addSubview(nameLabel)
         countLabel.font = .systemFont(ofSize: 11)
-        countLabel.textColor = .secondaryLabelColor
+        countLabel.textColor = EdenTheme.secondaryText
         countLabel.alignment = .right
         countLabel.frame = NSRect(x: 244, y: 14, width: 25, height: 18)
         addSubview(countLabel)
         chevron.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
-        chevron.contentTintColor = .secondaryLabelColor
+        chevron.contentTintColor = EdenTheme.primary
         chevron.frame = NSRect(x: 274, y: 17, width: 10, height: 12)
         chevron.isHidden = !showsChevron
         addSubview(chevron)
@@ -110,7 +184,18 @@ final class QuickPickerRow: NSButton {
     }
 
     private func updateBackground() {
-        layer?.backgroundColor = NSColor(white: 1, alpha: hovered ? 0.16 : 0.06).cgColor
+        let focused = window?.firstResponder === self
+        layer?.backgroundColor = (hovered || focused ? EdenTheme.selected : EdenTheme.surface).cgColor
+        layer?.borderWidth = focused ? 2 : 1
+        layer?.borderColor = (focused ? EdenTheme.focus : hovered ? EdenTheme.pressed : EdenTheme.primary).cgColor
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder(); updateBackground(); return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder(); updateBackground(); return resigned
     }
 
     override func updateTrackingAreas() {
@@ -133,6 +218,7 @@ final class QuickAppTile: NSButton {
         super.init(frame: .zero)
         self.title = ""
         isBordered = false
+        focusRingType = .none
         wantsLayer = true
         layer?.cornerRadius = 9
         toolTip = title
@@ -143,15 +229,16 @@ final class QuickAppTile: NSButton {
         addSubview(image)
         windowCount.font = .systemFont(ofSize: 10, weight: .semibold)
         windowCount.alignment = .center
-        windowCount.textColor = .white
+        windowCount.textColor = EdenTheme.text
         windowCount.wantsLayer = true
         windowCount.layer?.cornerRadius = 8
-        windowCount.layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.85).cgColor
+        windowCount.layer?.backgroundColor = EdenTheme.selected.cgColor
         windowCount.frame = NSRect(x: 45, y: 6, width: 19, height: 16)
         windowCount.isHidden = true
         addSubview(windowCount)
         let label = NSTextField(labelWithString: Self.twoLineTitle(title))
         label.font = .systemFont(ofSize: 10.5)
+        label.textColor = EdenTheme.text
         label.alignment = .center
         label.usesSingleLineMode = false
         label.lineBreakMode = .byTruncatingTail
@@ -206,9 +293,9 @@ final class QuickAppTile: NSButton {
     }
     private func updateAppearance() {
         let focused = window?.firstResponder === self
-        layer?.backgroundColor = NSColor(white: 1, alpha: hovered || focused ? 0.17 : 0.04).cgColor
-        layer?.borderWidth = focused ? 2 : 0
-        layer?.borderColor = NSColor.controlAccentColor.cgColor
+        layer?.backgroundColor = (hovered || focused ? EdenTheme.selected : EdenTheme.surface).cgColor
+        layer?.borderWidth = focused ? 2 : 1
+        layer?.borderColor = (focused ? EdenTheme.focus : hovered ? EdenTheme.pressed : EdenTheme.primary).cgColor
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -281,10 +368,81 @@ func hex(_ s: String) -> NSColor {
     return rgb(CGFloat(v >> 16 & 255) / 255, CGFloat(v >> 8 & 255) / 255, CGFloat(v & 255) / 255)
 }
 
+enum EdenTheme {
+    static let primary = hex("#A78BDA")
+    static let pressed = hex("#8260B3")
+    static let selected = hex("#493365")
+    static let focus = hex("#C4A7F2")
+    static let thought = hex("#30263E")
+    static let background = hex("#1C1923")
+    static let surface = hex("#292532")
+    static let text = hex("#F4EEFA")
+    static let secondaryText = hex("#C9BED5")
+    static let success = hex("#9CD8B2")
+    static let error = hex("#F0A0AE")
+
+    static func styleButton(_ button: NSButton) {
+        button.appearance = NSAppearance(named: .darkAqua)
+        button.isBordered = false
+        button.focusRingType = button is EdenButton ? .none : .default
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 8
+        button.layer?.backgroundColor = selected.cgColor
+        // AppKit does not apply contentTintColor to a plain button title reliably.
+        // Give both button-title states explicit foreground colours.
+        let title = button.title
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = button.alignment
+        paragraph.lineBreakMode = button.lineBreakMode
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: button.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: text,
+            .paragraphStyle: paragraph
+        ]
+        button.attributedTitle = NSAttributedString(string: title, attributes: attributes)
+        button.attributedAlternateTitle = NSAttributedString(string: title, attributes: attributes)
+        if let icon = button.image?.copy() as? NSImage {
+            icon.isTemplate = true
+            button.image = icon
+        }
+        button.contentTintColor = text
+        if let button = button as? EdenButton {
+            button.updateThemeState()
+        }
+    }
+
+    static func styleEntry(_ field: NSTextField) {
+        field.appearance = NSAppearance(named: .darkAqua)
+        field.textColor = text
+        field.backgroundColor = surface
+        field.focusRingType = .none
+        field.wantsLayer = true
+        field.layer?.cornerRadius = 7
+        field.layer?.borderWidth = 1
+        field.layer?.borderColor = primary.cgColor
+        stylePlaceholder(field)
+    }
+
+    static func stylePlaceholder(_ field: NSTextField) {
+        guard let placeholder = field.placeholderString else { return }
+        field.placeholderAttributedString = NSAttributedString(string: placeholder,
+            attributes: [.foregroundColor: secondaryText, .font: field.font ?? NSFont.systemFont(ofSize: 13)])
+    }
+
+    static func entryFocus(_ field: NSTextField, active: Bool) {
+        field.layer?.borderWidth = active ? 2 : 1
+        field.layer?.borderColor = (active ? focus : primary).cgColor
+    }
+
+    static func styleAlert(_ alert: NSAlert) {
+        alert.window.appearance = NSAppearance(named: .darkAqua)
+    }
+}
+
 // MARK: - shared bits
 
 let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Mochi")
-let cyanText = NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9)
+let accentText = EdenTheme.primary
 
 enum LauncherCommand: Equatable {
     case message
@@ -471,7 +629,8 @@ enum QuickChatLayout {
     static let appRowGap: CGFloat = 6
     static let input = NSRect(x: 12, y: 16, width: 316, height: 67)
     static let inputText = NSRect(x: 19, y: 22, width: 302, height: 55)
-    static let buttonSize = NSSize(width: 98, height: 46)
+    static let buttonSize = NSSize(width: 96, height: 46)
+    static let buttonColumnGap: CGFloat = 8
     static let buttonRowGap: CGFloat = 8
     static let buttonsBottom: CGFloat = 99
 
@@ -1204,10 +1363,12 @@ private final class CodexThreadPickerView: NSView {
         self.threads = threads
         super.init(frame: NSRect(x: 0, y: 0, width: 600, height: 90))
         popup.addItems(withTitles: threads.map { $0.title })
+        popup.appearance = NSAppearance(named: .darkAqua)
         popup.target = self; popup.action = #selector(updateDetails)
         addSubview(popup)
         details.frame = NSRect(x: 0, y: 0, width: 600, height: 56)
         details.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        details.textColor = EdenTheme.secondaryText
         addSubview(details)
         updateDetails()
     }
@@ -1234,22 +1395,22 @@ func glassPanel(_ size: NSSize, radius: CGFloat = 15) -> (Panel, NSView) {
     p.level = .floating; p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
     p.backgroundColor = .clear; p.isOpaque = false; p.hasShadow = true
     let ring = NSView(); ring.wantsLayer = true; ring.layer?.cornerRadius = radius
-    ring.layer?.borderWidth = 1; ring.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
+    ring.layer?.borderWidth = 1; ring.layer?.borderColor = EdenTheme.primary.cgColor
     p.contentView = ring
     let glass = NSVisualEffectView(frame: ring.bounds.insetBy(dx: 1, dy: 1)); glass.autoresizingMask = [.width, .height]
     glass.appearance = NSAppearance(named: .darkAqua); glass.material = .hudWindow; glass.blendingMode = .behindWindow; glass.state = .active
     glass.wantsLayer = true; glass.layer?.cornerRadius = radius - 1; glass.layer?.masksToBounds = true
-    glass.layer?.borderWidth = 1; glass.layer?.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
+    glass.layer?.borderWidth = 1; glass.layer?.borderColor = EdenTheme.selected.cgColor
     ring.addSubview(glass)
     let tint = NSView(frame: glass.bounds); tint.autoresizingMask = [.width, .height]
-    tint.wantsLayer = true; tint.layer?.backgroundColor = NSColor(white: 0.06, alpha: 0.62).cgColor
+    tint.wantsLayer = true; tint.layer?.backgroundColor = EdenTheme.background.cgColor
     glass.addSubview(tint)
     let content = NSView(frame: glass.bounds); content.autoresizingMask = [.width, .height]
     glass.addSubview(content)
     return (p, content)
 }
 
-func label(_ s: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = NSColor(white: 1, alpha: 0.92), mono: Bool = false, wrap: CGFloat? = nil) -> NSTextField {
+func label(_ s: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = EdenTheme.text, mono: Bool = false, wrap: CGFloat? = nil) -> NSTextField {
     let l = wrap == nil ? NSTextField(labelWithString: s) : NSTextField(wrappingLabelWithString: s)
     l.font = mono ? .monospacedSystemFont(ofSize: size, weight: weight) : .systemFont(ofSize: size, weight: weight)
     l.textColor = color
@@ -1927,7 +2088,7 @@ final class Visitors: NSView {
         }
         if extra > 0 {
             ("+\(extra)" as NSString).draw(at: NSPoint(x: CGFloat(shown) * 13 + 1, y: -1),
-                withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold), .foregroundColor: NSColor(white: 1, alpha: 0.7)])
+                withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold), .foregroundColor: EdenTheme.secondaryText])
         }
     }
 }
@@ -1980,7 +2141,7 @@ final class Social: NSView {
                     col_.setFill(); NSRect(x: x + CGFloat(col) * px, y: CGFloat(6 - row) * px, width: px, height: px).fill()
                 }
             }
-            (label(c.n) as NSString).draw(at: NSPoint(x: x + 17, y: 0), withAttributes: [.font: font, .foregroundColor: NSColor(white: 1, alpha: 0.85)])
+            (label(c.n) as NSString).draw(at: NSPoint(x: x + 17, y: 0), withAttributes: [.font: font, .foregroundColor: EdenTheme.text])
             x += slot(c.n)
         }
     }
@@ -1995,11 +2156,11 @@ final class TodoBadge: NSView {
     override func draw(_ r: NSRect) {
         guard n > 0 else { return }
         let icon = ["wwwwwww", "w.....w", "w...llw", "wg....w", "wwg.llw", "w.g...w", "wwwwwww"]
-        let pal: [Character: NSColor] = ["w": NSColor(white: 1, alpha: 0.8), "g": hex("#7ad3a3"), "l": NSColor(white: 1, alpha: 0.5)]
+        let pal: [Character: NSColor] = ["w": EdenTheme.text, "g": EdenTheme.success, "l": EdenTheme.secondaryText]
         for (row, line) in icon.enumerated() {
             for (col, ch) in line.enumerated() { guard let c = pal[ch] else { continue }; c.setFill(); NSRect(x: CGFloat(col) * px, y: CGFloat(6 - row) * px, width: px, height: px).fill() }
         }
-        ("\(n)" as NSString).draw(at: NSPoint(x: 17, y: 0), withAttributes: [.font: font, .foregroundColor: NSColor(white: 1, alpha: 0.85)])
+        ("\(n)" as NSString).draw(at: NSPoint(x: 17, y: 0), withAttributes: [.font: font, .foregroundColor: EdenTheme.text])
     }
 }
 
@@ -2185,6 +2346,8 @@ enum BubblePriority {
     }
 }
 
+enum BubbleTone { case normal, success, error }
+
 struct BubbleCoordinator {
     private(set) var generation = 0
     private(set) var priority: BubblePriority?
@@ -2322,6 +2485,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     // summary bubble that pops up above the bar when Claude finishes a reply (fed by notify.py, a Claude Code Stop hook)
     var bubble: Panel!
+    private var bubbleRing: NSView!
+    private var bubbleTint: NSView!
     var bubbleText: NSTextField!
     var bubbleProject: NSTextField!
     var lastSeen: Date?
@@ -2412,7 +2577,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         chatRing.autoresizingMask = [.width, .height]
         chatRing.wantsLayer = true
         chatRing.layer?.borderWidth = 1
-        chatRing.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
+        chatRing.layer?.borderColor = EdenTheme.primary.cgColor
         chatPanel.contentView = chatRing
 
         let glass = PillGlass(frame: NSRect(x: 1, y: 1, width: W - 2, height: H - 2))
@@ -2421,13 +2586,13 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         glass.appearance = NSAppearance(named: .darkAqua)
         glass.material = .hudWindow; glass.blendingMode = .behindWindow; glass.state = .active
         glass.wantsLayer = true; glass.layer?.cornerRadius = 15; glass.layer?.masksToBounds = true
-        glass.layer?.borderWidth = 1; glass.layer?.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
+        glass.layer?.borderWidth = 1; glass.layer?.borderColor = EdenTheme.selected.cgColor
         chatRing.addSubview(glass)
 
         // tint so the pill stays dark whatever is behind it
         let tint = NSView(frame: glass.bounds)
         tint.autoresizingMask = [.width, .height]
-        tint.wantsLayer = true; tint.layer?.backgroundColor = NSColor(white: 0.06, alpha: 0.62).cgColor
+        tint.wantsLayer = true; tint.layer?.backgroundColor = EdenTheme.background.cgColor
         glass.addSubview(tint)
 
         petHandle = PetHandle(frame: NSRect(x: 0, y: 0, width: w, height: h))
@@ -2451,18 +2616,18 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         glass.addSubview(todoBadge)
         todoBadge.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clickedTodoBadge(_:))))
         meter = NSTextField(labelWithString: "")
-        meter.font = .monospacedSystemFont(ofSize: 10, weight: .medium); meter.textColor = cyanText
+        meter.font = .monospacedSystemFont(ofSize: 10, weight: .medium); meter.textColor = accentText
         glass.addSubview(meter)
 
         // Kept for existing status updates, but never shown in the pet-only view.
         mini = Wave("Eden")
         mini.font = .systemFont(ofSize: 13, weight: .medium)
-        mini.textColor = NSColor(white: 1, alpha: 0.85)
+        mini.textColor = EdenTheme.secondaryText
         glass.addSubview(mini)
 
         chatTitle = NSTextField(labelWithString: "Eden")
         chatTitle.font = .systemFont(ofSize: 14, weight: .semibold)
-        chatTitle.textColor = .white
+        chatTitle.textColor = EdenTheme.text
         glass.addSubview(chatTitle)
         closeChatButton = Tap(frame: .zero)
         closeChatButton.title = "×"
@@ -2471,14 +2636,15 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         closeChatButton.target = self
         closeChatButton.action = #selector(collapseChat)
         closeChatButton.toolTip = "Close chat (draft kept)"
+        closeChatButton.contentTintColor = EdenTheme.secondaryText
         glass.addSubview(closeChatButton)
 
         inputBackground = NSView(frame: .zero)
         inputBackground.wantsLayer = true
         inputBackground.layer?.cornerRadius = 10
-        inputBackground.layer?.backgroundColor = NSColor(white: 1, alpha: 0.08).cgColor
+        inputBackground.layer?.backgroundColor = EdenTheme.surface.cgColor
         inputBackground.layer?.borderWidth = 1
-        inputBackground.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
+        inputBackground.layer?.borderColor = EdenTheme.primary.cgColor
         glass.addSubview(inputBackground)
         inputScroll = NSScrollView(frame: .zero)
         inputScroll.drawsBackground = false
@@ -2488,7 +2654,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         glass.addSubview(inputScroll)
         field = Field(frame: NSRect(x: 0, y: 0, width: 296, height: 60))
         resetPlaceholder()
-        field.font = .systemFont(ofSize: 14); field.textColor = .white
+        field.font = .systemFont(ofSize: 14); field.textColor = EdenTheme.text
+        field.insertionPointColor = EdenTheme.focus
+        field.selectedTextAttributes = [.backgroundColor: EdenTheme.selected, .foregroundColor: EdenTheme.text]
         field.drawsBackground = false; field.isRichText = false
         field.isHorizontallyResizable = false; field.isVerticallyResizable = true
         field.textContainer?.widthTracksTextView = true
@@ -2499,20 +2667,21 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
         status = NSTextField(labelWithString: "desktop commands")
         status.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
-        status.textColor = NSColor(white: 1, alpha: 0.6); status.alignment = .left
+        status.textColor = EdenTheme.secondaryText; status.alignment = .left
         status.frame = NSRect(x: 54, y: 16, width: W - 72, height: 14)
         status.cell?.lineBreakMode = .byTruncatingMiddle
         glass.addSubview(status)
 
         quickSectionLabel = NSTextField(labelWithString: "Quick Actions")
         quickSectionLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        quickSectionLabel.textColor = NSColor(white: 1, alpha: 0.78)
+        quickSectionLabel.textColor = EdenTheme.primary
         glass.addSubview(quickSectionLabel)
-        quickBackButton = NSButton(title: "Back", target: self, action: #selector(quickBack))
-        quickCancelButton = NSButton(title: "Cancel", target: self, action: #selector(quickCancel))
+        quickBackButton = EdenButton(title: "Back", target: self, action: #selector(quickBack))
+        quickCancelButton = EdenButton(title: "Cancel", target: self, action: #selector(quickCancel))
         for button in [quickBackButton!, quickCancelButton!] {
             button.bezelStyle = .rounded
             button.font = .systemFont(ofSize: 11)
+            EdenTheme.styleButton(button)
             glass.addSubview(button)
         }
         quickScroll = NSScrollView(frame: .zero)
@@ -2526,7 +2695,9 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickSearch = NSSearchField(frame: .zero)
         quickSearch.placeholderString = "Search installed apps"
         quickSearch.delegate = self
+        EdenTheme.styleEntry(quickSearch)
         quickFolderPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        quickFolderPopup.appearance = NSAppearance(named: .darkAqua)
         quickFolderPopup.target = self
         quickFolderPopup.action = #selector(chooseQuickFolderFromPopup(_:))
         quickFolderPopup.isHidden = true
@@ -2534,28 +2705,38 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickSystemToggle = NSButton(checkboxWithTitle: "Show System Apps", target: self,
                                      action: #selector(toggleQuickSystemApps(_:)))
         quickSystemToggle.font = .systemFont(ofSize: 10)
+        quickSystemToggle.appearance = NSAppearance(named: .darkAqua)
+        quickSystemToggle.attributedTitle = NSAttributedString(string: "Show System Apps",
+            attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: EdenTheme.text])
+        quickSystemToggle.contentTintColor = EdenTheme.primary
         quickSystemToggle.isHidden = true
         glass.addSubview(quickSystemToggle)
         quickCopyField = NSTextField(frame: .zero)
         quickCopyField.placeholderString = "Text to copy"
+        quickCopyField.delegate = self
+        EdenTheme.styleEntry(quickCopyField)
         quickCopyField.target = self
         quickCopyField.action = #selector(copyQuickText)
-        quickCopyButton = NSButton(title: "Copy to Clipboard", target: self, action: #selector(copyQuickText))
+        quickCopyButton = EdenButton(title: "Copy to Clipboard", target: self, action: #selector(copyQuickText))
         quickCopyButton.bezelStyle = .rounded
+        EdenTheme.styleButton(quickCopyButton)
         for action in QuickActionFlow.Action.allCases {
-            let button = NSButton(title: action.title, target: self, action: #selector(chooseQuickAction(_:)))
+            let button = EdenButton(title: action.title, target: self, action: #selector(chooseQuickAction(_:)))
             button.tag = action.rawValue
             button.image = NSImage(systemSymbolName: action.symbol, accessibilityDescription: action.title)
             button.imagePosition = .imageLeft
             button.bezelStyle = .rounded
+            button.compactQuickAction = true
+            EdenTheme.styleButton(button)
             quickActionButtons.append(button)
         }
         for (index, name) in ["ChatGPT", "Claude"].enumerated() {
-            let button = NSButton(title: name, target: self, action: #selector(chooseQuickMessage(_:)))
+            let button = EdenButton(title: name, target: self, action: #selector(chooseQuickMessage(_:)))
             button.tag = index
             button.image = NSImage(systemSymbolName: "bubble.left", accessibilityDescription: name)
             button.imagePosition = .imageLeft
             button.bezelStyle = .rounded
+            EdenTheme.styleButton(button)
             quickMessageButtons.append(button)
         }
         renderQuickActions()
@@ -2628,7 +2809,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 showBubble(CatSprites.neutral == nil
                     ? "Eden cat artwork is unavailable: \(issues.joined(separator: "; ")). Rebuild Eden with its sprite assets."
                     : "Some Eden cat frames are unavailable: \(issues.joined(separator: "; ")). Using Eden artwork where possible.",
-                    project: "Eden", react: false)
+                    project: "Eden", react: false, tone: .error)
             }
         } else {
             NSLog("Eden pet renderer: original Mochi (explicit PB_PET_ART override)")
@@ -2642,7 +2823,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         NSLog("Eden other processes with this bundle identifier: %d", others.count)
         if !others.isEmpty && CatSprites.neutral != nil {
             showBubble("Another app with Eden's bundle identifier is running. Check older app copies if you see the wrong pet.",
-                       project: "Eden", react: false)
+                       project: "Eden", react: false, tone: .error)
         }
     }
 
@@ -2867,7 +3048,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     @objc private func showCodexSendDiagnostics() {
         let enabled = UserDefaults.standard.bool(forKey: "codexSendDiagnosticsEnabled")
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Codex send diagnostics"
         if enabled {
             alert.informativeText = codexSendDiagnostic?.report ?? "Enabled. No direct-send attempt has been recorded in this app session."
@@ -2936,7 +3117,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     private func updateDestinationDisplay() {
         status.stringValue = destinationLabel()
-        status.textColor = NSColor(white: 1, alpha: 0.6)
+        status.textColor = EdenTheme.secondaryText
         status.toolTip = "Ask for a desktop action. Terminal sending is in Advanced."
         resetPlaceholder()
         lay()
@@ -2958,7 +3139,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     @objc func browseCodexThreads() {
         pauseIdleThoughts(interaction: true)
         if !UserDefaults.standard.bool(forKey: "codexHistoryConsent") {
-            let alert = NSAlert()
+            let alert = NSAlert(); EdenTheme.styleAlert(alert)
             alert.messageText = "Browse local Codex threads?"
             alert.informativeText = "Eden will start its own local Codex App Server connection to browse thread titles, directories and selected transcript text. Browsing is read-only. Thread data stays in memory."
             alert.addButton(withTitle: "Allow browsing")
@@ -3050,7 +3231,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         guard !discoveredThreads.isEmpty else {
             historyError("No local Codex threads were returned for this account, host and source filter."); return
         }
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Local Codex threads"
         alert.informativeText = "Showing up to 100 local threads. Preview the latest 8 turns or open a thread in Codex."
         let picker = CodexThreadPickerView(threads: discoveredThreads)
@@ -3125,14 +3306,17 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             }
         }
         let body = note ?? (lines.isEmpty ? "No text messages in the latest 8 turns." : lines.joined(separator: "\n\n"))
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = thread.title
         alert.informativeText = "ID: \(thread.id)\nDirectory: \(thread.cwd)\nSource: \(thread.source) · Status: \(thread.status)\nLatest 8 turns only"
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 580, height: 300))
         scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        scroll.backgroundColor = EdenTheme.background
         let view = NSTextView(frame: scroll.bounds)
         view.string = String(body.prefix(8_000)); view.isEditable = false; view.isSelectable = true
         view.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        view.textColor = EdenTheme.text
+        view.backgroundColor = EdenTheme.background
         scroll.documentView = view; alert.accessoryView = scroll
         if thread.local { alert.addButton(withTitle: "Open in Codex") }
         alert.addButton(withTitle: "Back to threads")
@@ -3151,8 +3335,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         dot.processing = false
         if closeConnection { historyClient?.stop(); historyClient = nil; discoveredThreads = [] }
         showBubble("I couldn't load Codex conversations. Your draft is still here.",
-                   project: "Eden", react: false)
-        let alert = NSAlert()
+                   project: "Eden", react: false, tone: .error)
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Codex threads unavailable"
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
@@ -3186,8 +3370,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     // (the visitors strip is kept for anyone who wants to feed it their own list: call showVisitors with [["name", "tint", "page"]])
     func showVisitors(_ here: [[String: Any]]) {
-        let tint: [String: NSColor] = ["mint": hex("#7ad3a3"), "lilac": hex("#b89bff"), "sky": hex("#8cc1ff")]
-        visitors.tints = here.map { tint[$0["tint"] as? String ?? ""] ?? hex("#7ad3a3") }
+        let tint: [String: NSColor] = ["mint": EdenTheme.primary, "lilac": EdenTheme.focus, "sky": EdenTheme.pressed]
+        visitors.tints = here.map { tint[$0["tint"] as? String ?? ""] ?? EdenTheme.primary }
         func place(_ m: [String: Any]) -> String {
             var p = (m["page"] as? String ?? "").replacingOccurrences(of: ".html", with: "")
             if p.hasPrefix("app#") { p = String(p.dropFirst(4)) } else if p == "app" || p.isEmpty { p = "home" }
@@ -3384,7 +3568,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: 100)
             for (index, button) in quickActionButtons.enumerated() {
                 let col = index % 3, row = index / 3
-                button.frame = NSRect(x: CGFloat(col) * 102,
+                button.frame = NSRect(x: 2 + CGFloat(col) * (QuickChatLayout.buttonSize.width + QuickChatLayout.buttonColumnGap),
                                       y: CGFloat(1 - row) * (QuickChatLayout.buttonSize.height + QuickChatLayout.buttonRowGap),
                                       width: QuickChatLayout.buttonSize.width, height: QuickChatLayout.buttonSize.height)
                 quickContent.addSubview(button)
@@ -3407,6 +3591,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 }
             case .open, .switchTo, .hide, .quit:
                 quickSearch.placeholderString = action == .open ? "Search installed apps" : "Search running apps"
+                EdenTheme.stylePlaceholder(quickSearch)
                 if action == .open || action == .switchTo {
                     chatGlass.addSubview(quickSearch)
                     quickFolderPopup.isHidden = action != .open
@@ -3419,6 +3604,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         case .selectingWindow:
             quickSectionLabel.stringValue = quickSwitchTarget.map { "\($0.app.displayName) Windows" } ?? "Windows"
             quickSearch.placeholderString = "Search windows"
+            EdenTheme.stylePlaceholder(quickSearch)
             if quickWindowFallback == nil { quickContent.addSubview(quickSearch) }
             renderQuickWindowList()
         }
@@ -3457,7 +3643,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickSearch.frame = NSRect(x: 0, y: contentHeight - 30, width: W - 48, height: 26)
         if count == 0 {
             let label = NSTextField(labelWithString: quickLoading ? "Finding apps…" : "No matching apps or folders")
-            label.textColor = NSColor(white: 1, alpha: 0.7)
+            label.textColor = EdenTheme.secondaryText
             label.frame = NSRect(x: 4, y: contentHeight - 67, width: W - 48, height: 20)
             quickContent.addSubview(label); quickRows.append(label)
         }
@@ -3495,7 +3681,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         }
         if filtered.count > 100 {
             let label = NSTextField(labelWithString: "Showing 100 apps. Search to narrow the list.")
-            label.textColor = NSColor(white: 1, alpha: 0.7)
+            label.textColor = EdenTheme.secondaryText
             label.frame = NSRect(x: 4, y: 5, width: W - 48, height: 20)
             quickContent.addSubview(label); quickRows.append(label)
         }
@@ -3536,7 +3722,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             let message = quickLoading && action == .open ? "Finding apps…" :
                 (action == .open ? "No matching applications" : "No matching running apps")
             let label = NSTextField(labelWithString: message)
-            label.textColor = NSColor(white: 1, alpha: 0.7)
+            label.textColor = EdenTheme.secondaryText
             label.frame = NSRect(x: 8, y: contentHeight - 28, width: 280, height: 20)
             quickContent.addSubview(label); quickRows.append(label)
         }
@@ -3601,11 +3787,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         quickContent.frame = NSRect(x: 0, y: 0, width: W - 32, height: contentHeight)
         if let reason = quickWindowFallback {
             let note = NSTextField(wrappingLabelWithString: reason)
-            note.textColor = NSColor(white: 1, alpha: 0.8)
+            note.textColor = EdenTheme.secondaryText
             note.frame = NSRect(x: 4, y: contentHeight - 100, width: W - 44, height: 88)
             quickContent.addSubview(note); quickRows.append(note)
             if let target = quickSwitchTarget {
-                let button = NSButton(title: "Activate \(target.app.displayName) normally", target: self,
+                let button = EdenButton(title: "Activate \(target.app.displayName) normally", target: self,
                                       action: #selector(activateQuickAppNormally))
                 styleQuickRow(button, y: contentHeight - 138)
             }
@@ -3613,7 +3799,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             quickSearch.frame = NSRect(x: 0, y: contentHeight - 30, width: W - 48, height: 26)
             if visible.isEmpty {
                 let note = NSTextField(labelWithString: "No matching windows")
-                note.textColor = NSColor(white: 1, alpha: 0.7)
+                note.textColor = EdenTheme.secondaryText
                 note.frame = NSRect(x: 4, y: contentHeight - 67, width: W - 48, height: 20)
                 quickContent.addSubview(note); quickRows.append(note)
             }
@@ -3621,7 +3807,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 let title = QuickWindowSwitcher.label(entry.element.title, index: entry.offset,
                                                         minimized: entry.element.minimized)
                 let repeated = quickWindowTargets.filter { $0.title == entry.element.title }.count > 1
-                let button = NSButton(title: repeated ? "\(title) · Window \(entry.offset + 1)" : title,
+                let button = EdenButton(title: repeated ? "\(title) · Window \(entry.offset + 1)" : title,
                                       target: self, action: #selector(chooseQuickWindow(_:)))
                 button.tag = entry.offset
                 button.toolTip = title
@@ -3635,6 +3821,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     private func styleQuickRow(_ button: NSButton, y: CGFloat) {
         button.frame = NSRect(x: 0, y: y, width: W - 48, height: 30)
         button.bezelStyle = .rounded
+        EdenTheme.styleButton(button)
         button.imagePosition = .imageLeft
         button.alignment = .left
         button.lineBreakMode = .byTruncatingMiddle
@@ -3719,7 +3906,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         if action == .switchTo {
             guard let pid = target.pid, runningCopy(of: target.app, preferredPID: pid) != nil else {
                 dot.worry()
-                showBubble("\(target.app.displayName) isn't running. Your draft is still here.", project: "Eden", react: false)
+                showBubble("\(target.app.displayName) isn't running. Your draft is still here.", project: "Eden", react: false, tone: .error)
                 renderQuickList()
                 return
             }
@@ -3772,7 +3959,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             else {
                 self.renderQuickList()
             }
-            self.showBubble(message + (outcome.isSuccess ? "." : ". Your draft is still here."), project: "Eden", react: false)
+            self.showBubble(message + (outcome.isSuccess ? "." : ". Your draft is still here."), project: "Eden", react: false,
+                            tone: outcome.isFailure ? .error : outcome.isSuccess ? .success : .normal)
         }
     }
 
@@ -3785,7 +3973,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         } else {
             if quickFlow.state == .selectingWindow { renderQuickWindowList() }
         }
-        showBubble(message + (outcome.isSuccess ? "." : ". Your draft is still here."), project: "Eden", react: false)
+        showBubble(message + (outcome.isSuccess ? "." : ". Your draft is still here."), project: "Eden", react: false,
+                   tone: outcome.isFailure ? .error : outcome.isSuccess ? .success : .normal)
     }
 
     @objc private func chooseQuickWindow(_ sender: NSButton) {
@@ -3862,36 +4051,38 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         bubble.backgroundColor = .clear; bubble.isOpaque = false; bubble.hasShadow = true
 
         let ring = NSView(); ring.wantsLayer = true; ring.layer?.cornerRadius = 15
-        ring.layer?.borderWidth = 1; ring.layer?.borderColor = NSColor(white: 0, alpha: 0.45).cgColor
+        bubbleRing = ring
+        ring.layer?.borderWidth = 1; ring.layer?.borderColor = EdenTheme.primary.cgColor
         bubble.contentView = ring
 
         let glass = NSVisualEffectView(frame: ring.bounds.insetBy(dx: 1, dy: 1)); glass.autoresizingMask = [.width, .height]
         glass.appearance = NSAppearance(named: .darkAqua)
         glass.material = .hudWindow; glass.blendingMode = .behindWindow; glass.state = .active
         glass.wantsLayer = true; glass.layer?.cornerRadius = 14; glass.layer?.masksToBounds = true
-        glass.layer?.borderWidth = 1; glass.layer?.borderColor = NSColor(white: 1, alpha: 0.28).cgColor
+        glass.layer?.borderWidth = 1; glass.layer?.borderColor = EdenTheme.selected.cgColor
         ring.addSubview(glass)
         let tint = NSView(frame: glass.bounds); tint.autoresizingMask = [.width, .height]
-        tint.wantsLayer = true; tint.layer?.backgroundColor = NSColor(white: 0.06, alpha: 0.62).cgColor
+        bubbleTint = tint
+        tint.wantsLayer = true; tint.layer?.backgroundColor = EdenTheme.surface.cgColor
         glass.addSubview(tint)
 
         bubbleProject = NSTextField(labelWithString: "")
         bubbleProject.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
-        bubbleProject.textColor = NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9)
+        bubbleProject.textColor = EdenTheme.primary
         glass.addSubview(bubbleProject)
 
         bubbleText = NSTextField(wrappingLabelWithString: "")
-        bubbleText.font = .systemFont(ofSize: 13); bubbleText.textColor = NSColor(white: 1, alpha: 0.92)
+        bubbleText.font = .systemFont(ofSize: 13); bubbleText.textColor = EdenTheme.text
         bubbleText.maximumNumberOfLines = 0; bubbleText.cell?.wraps = true
         glass.addSubview(bubbleText)
 
         // long replies come in pages: arrows on the sides, and "2/5" up top
         pageLabel = NSTextField(labelWithString: "")
-        pageLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium); pageLabel.textColor = NSColor(white: 1, alpha: 0.5)
+        pageLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium); pageLabel.textColor = EdenTheme.secondaryText
         glass.addSubview(pageLabel)
         func arrow(_ t: String, _ a: Selector) -> Tap {
             let b = Tap(frame: .zero); b.isBordered = false; b.target = self; b.action = a
-            b.attributedTitle = NSAttributedString(string: t, attributes: [.font: NSFont.systemFont(ofSize: 24, weight: .regular), .foregroundColor: NSColor(white: 1, alpha: 0.8)])
+            b.attributedTitle = NSAttributedString(string: t, attributes: [.font: NSFont.systemFont(ofSize: 24, weight: .regular), .foregroundColor: EdenTheme.primary])
             glass.addSubview(b); return b
         }
         prevBtn = arrow("‹", #selector(prevPage)); nextBtn = arrow("›", #selector(nextPage))
@@ -3972,9 +4163,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     @discardableResult
     func showBubble(_ text: String, project: String, react: Bool = true, full: String? = nil,
-                    priority: BubblePriority = .feedback, duration: TimeInterval? = nil) -> Bool {
+                    priority: BubblePriority = .feedback, duration: TimeInterval? = nil,
+                    tone: BubbleTone = .normal) -> Bool {
         if idleThoughtVisible && priority != .idleThought { pauseIdleThoughts() }
         guard let generation = bubbleCoordinator.offer(priority) else { return false }
+        styleBubble(priority: priority, tone: tone)
         bubble.ignoresMouseEvents = false
         note("bubble shown")
         // the goo reacts: a proud double hop with sparkles when something went live, otherwise a hop
@@ -4001,6 +4194,20 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         }
         armHide(duration ?? (pages.count > 1 ? 16 : 5 + Double(body.count) / 25), generation: generation)
         return true
+    }
+
+    private func styleBubble(priority: BubblePriority, tone: BubbleTone) {
+        let casual = priority == .idleThought || priority == .petting
+        bubbleTint.layer?.backgroundColor = (casual ? EdenTheme.thought : EdenTheme.surface).cgColor
+        let accent: NSColor
+        switch tone {
+        case .success: accent = EdenTheme.success
+        case .error: accent = EdenTheme.error
+        case .normal: accent = priority == .provider ? EdenTheme.focus : EdenTheme.primary
+        }
+        bubbleRing.layer?.borderColor = accent.cgColor
+        bubbleProject.textColor = accent
+        bubbleText.textColor = EdenTheme.text
     }
 
     // hide after a while, but never while the mouse is resting on it
@@ -4156,17 +4363,45 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         return false
     }
 
+    func textDidBeginEditing(_ notification: Notification) {
+        if notification.object as? NSTextView === field {
+            inputBackground.layer?.borderWidth = 2
+            inputBackground.layer?.borderColor = EdenTheme.focus.cgColor
+        }
+    }
+
+    func textDidEndEditing(_ notification: Notification) {
+        if notification.object as? NSTextView === field {
+            inputBackground.layer?.borderWidth = 1
+            inputBackground.layer?.borderColor = EdenTheme.primary.cgColor
+        }
+    }
+
+    func controlTextDidBeginEditing(_ notification: Notification) {
+        if let entry = notification.object as? NSTextField,
+           entry === quickSearch || entry === quickCopyField {
+            EdenTheme.entryFocus(entry, active: true)
+        }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        if let entry = notification.object as? NSTextField,
+           entry === quickSearch || entry === quickCopyField {
+            EdenTheme.entryFocus(entry, active: false)
+        }
+    }
+
     func textDidChange(_ notification: Notification) { field.needsDisplay = true }
 
     // a short note in whichever label is showing
     func flash(_ s: String, _ ok: Bool = true) {
-        let c = ok ? NSColor(red: 0.5, green: 0.9, blue: 1, alpha: 0.9) : NSColor(red: 1, green: 0.55, blue: 0.55, alpha: 0.95)
+        let c = ok ? EdenTheme.success : EdenTheme.error
         status.stringValue = s; status.textColor = c
         mini.stringValue = s; mini.textColor = c; mini.sizeToFit(); lay(); mini.needsDisplay = true
-        if !open, bubble != nil { showBubble(s, project: "Eden", react: false) }
+        if !open, bubble != nil { showBubble(s, project: "Eden", react: false, tone: ok ? .success : .error) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            self.status.stringValue = self.destinationLabel(); self.status.textColor = NSColor(white: 1, alpha: 0.6)
-            self.mini.stringValue = "Eden"; self.mini.textColor = NSColor(white: 1, alpha: 0.85); self.mini.sizeToFit(); self.lay()
+            self.status.stringValue = self.destinationLabel(); self.status.textColor = EdenTheme.secondaryText
+            self.mini.stringValue = "Eden"; self.mini.textColor = EdenTheme.secondaryText; self.mini.sizeToFit(); self.lay()
         }
     }
 
@@ -4462,7 +4697,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     private func showBlockedCodexResume(_ thread: CodexHistoryClient.Thread, category: String) {
         guard selectedCodexThread?.id == thread.id, provider == .codex, codexRoute == .desktop else { return }
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Codex cannot resume this conversation now"
         let writerConflict = category.contains("writer") || category.contains("rollout path")
         alert.informativeText = writerConflict
@@ -4583,7 +4818,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         guard let activeID = codexTurnID, params["turnId"] as? String == activeID else {
             declineCodexRequest(id, method, client: client); return
         }
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Codex requests approval"
         let reason = (params["reason"] as? String) ?? ""
         codexActivity = "Codex needs approval…"; updateDestinationDisplay()
@@ -4619,9 +4854,12 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             if let preview {
                 let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 280))
                 scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+                scroll.backgroundColor = EdenTheme.background
                 let view = NSTextView(frame: scroll.bounds)
                 view.string = preview; view.isEditable = false; view.isSelectable = true
                 view.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+                view.textColor = EdenTheme.text
+                view.backgroundColor = EdenTheme.background
                 scroll.documentView = view; alert.accessoryView = scroll
                 alert.addButton(withTitle: "Approve once")
             } else { alert.informativeText += "\nNo complete change preview is available here; decline and review in Codex." }
@@ -4705,19 +4943,19 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         case .showDesktopUnavailable:
             dot.worry()
             showBubble("I can't reliably show Desktop with a supported macOS command. You can open the Desktop folder instead.",
-                       project: "Eden", react: false)
+                       project: "Eden", react: false, tone: .error)
             return
         case .invalidAppReference:
             dot.worry()
             showBubble("Use an installed app name, not a path or link. Your message is still here.",
-                       project: "apps", react: false)
+                       project: "apps", react: false, tone: .error)
             return
         }
         if answeringOther && provider == .claude { answer(nil, other: text); return }
         if handleTodo(text) { return }
         if LauncherCommandParser.isExplicitDesktopCommand(text) { dot.worry() }
         showBubble("Try Open, Switch to, Hide or Quit an app; Open Downloads; or Copy text: hello. For CLI messages, use Advanced → Send Draft to Terminal.",
-                   project: "Eden", react: false)
+                   project: "Eden", react: false, tone: .error)
     }
 
     private func startGuidedMessage(_ destination: GuidedMessageDestination, preserveTypedDraft: Bool = false) {
@@ -4740,7 +4978,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     private func confirmGuidedMessage() {
         guard case .confirming(let destination, let draft) = guidedMessage.state else { return }
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Message \(destination.name)"
         let preview = draft.count > 280 ? String(draft.prefix(280)) + "…" : draft
         alert.informativeText = "Copy this message and open \(destination.name)? Choose a conversation, then paste and send it yourself.\n\n\(preview)"
@@ -4768,7 +5006,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         guard pasteboard.setString(draft, forType: .string) else {
             restoreClipboard(pasteboard, items: previousItems, ifUnchanged: pasteboard.changeCount)
             dot.worry()
-            showBubble("Clipboard unavailable. Your draft is still here.", project: destination.name, react: false)
+            showBubble("Clipboard unavailable. Your draft is still here.", project: destination.name, react: false, tone: .error)
             return
         }
         sending = true
@@ -4785,12 +5023,12 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 self.resetPlaceholder()
                 self.setOpen(false)
                 self.showBubble("Copied. \(place) Choose your conversation, then paste and send.",
-                                project: destination.name, react: false)
+                                project: destination.name, react: false, tone: .success)
             } else {
                 self.field.stringValue = draft
                 self.dot.worry()
                 self.showBubble("I couldn't open \(destination.name) or its website. Your draft is still here.",
-                                project: destination.name, react: false)
+                                project: destination.name, react: false, tone: .error)
             }
         }
         let openWebsite: () -> Void = {
@@ -4839,7 +5077,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                        project: "Eden", react: false)
             return
         }
-        let confirmation = NSAlert()
+        let confirmation = NSAlert(); EdenTheme.styleAlert(confirmation)
         confirmation.messageText = "Send to \(provider.adapter.name) in Terminal?"
         confirmation.informativeText = "Eden will use an existing verified Terminal session. Your draft stays if you cancel."
         confirmation.addButton(withTitle: "Continue")
@@ -4902,7 +5140,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             field.stringValue = ""
         }
         if success { dot.happy() } else { dot.worry() }
-        showBubble(success ? successText + "." : failureText + ". Draft kept.", project: "Eden", react: false)
+        showBubble(success ? successText + "." : failureText + ". Draft kept.", project: "Eden", react: false,
+                   tone: success ? .success : .error)
     }
 
     private func copyDesktopText(_ text: String, draft: String, preserveDraft: Bool = false) {
@@ -4958,7 +5197,8 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
                 field.stringValue = ""
             }
             showBubble(results.joined(separator: "; ") + (outcome.isSuccess ? "." : ". Draft kept."),
-                       project: "apps", react: false)
+                       project: "apps", react: false,
+                       tone: outcome.isFailure ? .error : outcome.isSuccess ? .success : .normal)
             return
         }
         let name = names[index]
@@ -4990,7 +5230,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     private func chooseLauncherApp(_ apps: [InstalledApplication], for name: String,
                                    approximate: Bool, action: DesktopAppAction) -> InstalledApplication? {
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = approximate ? "Choose an app for \(name)" : "Several apps match \(name)"
         alert.informativeText = approximate
             ? "No exact app matched. Choose explicitly; Eden won't guess."
@@ -5054,7 +5294,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
             case .quit:
                 dot.processing = false
                 dot.cancelThinking()
-                let alert = NSAlert()
+                let alert = NSAlert(); EdenTheme.styleAlert(alert)
                 alert.messageText = "Quit \(app.displayName)?"
                 alert.informativeText = "Unsaved work could be affected. \(app.displayName) may ask you to save before it quits. Eden will never force quit it."
                 alert.addButton(withTitle: "Quit \(app.displayName)")
@@ -5110,7 +5350,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     }
 
     func chooseSession(_ ttys: [String], provider name: String) -> String? {
-        let alert = NSAlert()
+        let alert = NSAlert(); EdenTheme.styleAlert(alert)
         alert.messageText = "Choose a \(name) Terminal session"
         alert.informativeText = "Several sessions are running. Run tty in a tab if you need to identify it. Your draft stays in Eden if you cancel."
         alert.addButton(withTitle: "Send to selected session")
@@ -5140,7 +5380,7 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
     }
 
     func resetPlaceholder(_ s: String = "Ask Eden to do something…") {
-        field.placeholderAttributedString = NSAttributedString(string: s, attributes: [.foregroundColor: NSColor(white: 1, alpha: 0.62), .font: NSFont.systemFont(ofSize: 14)])
+        field.placeholderAttributedString = NSAttributedString(string: s, attributes: [.foregroundColor: EdenTheme.secondaryText, .font: NSFont.systemFont(ofSize: 14)])
     }
 
     // MARK: to-do list
@@ -5214,20 +5454,20 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         box.subviews.forEach { $0.removeFromSuperview() }
         let W: CGFloat = 300, pad: CGFloat = 14, iw = W - 2 - pad * 2
         let openN = todos.filter { $0.done == nil }.count
-        var views: [NSView] = [label("Eden · to-do" + (openN > 0 ? "   \(openN) open" : ""), size: 10, weight: .medium, color: cyanText, mono: true)]
+        var views: [NSView] = [label("Eden · to-do" + (openN > 0 ? "   \(openN) open" : ""), size: 10, weight: .medium, color: accentText, mono: true)]
         let close = Tap(frame: NSRect(x: 0, y: 0, width: 20, height: 18)); close.isBordered = false; close.target = self; close.action = #selector(closeTodoList)
-        close.attributedTitle = NSAttributedString(string: "×", attributes: [.font: NSFont.systemFont(ofSize: 16), .foregroundColor: NSColor(white: 1, alpha: 0.55)])
+        close.attributedTitle = NSAttributedString(string: "×", attributes: [.font: NSFont.systemFont(ofSize: 16), .foregroundColor: EdenTheme.secondaryText])
         close.toolTip = "Close"
         let list = todos.sorted { ($0.done == nil ? 0 : 1, $0.added) < ($1.done == nil ? 0 : 1, $1.added) }
         if list.isEmpty {
-            views.append(label("All clear ✨  Tell Eden “todo: …” to add something.", size: 12, color: NSColor(white: 1, alpha: 0.7), wrap: iw))
+            views.append(label("All clear ✨  Tell Eden “todo: …” to add something.", size: 12, color: EdenTheme.secondaryText, wrap: iw))
             // nothing left (and no badge to click): close on its own in a moment
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in if self?.todos.isEmpty == true { self?.hideTodoList() } }
         }
         for t in list.prefix(14) { views.append(todoRow(t, width: iw)) }
         if list.contains(where: { $0.done != nil }) {
             let c = Tap(frame: .zero); c.isBordered = false; c.target = self; c.action = #selector(clearDone)
-            c.attributedTitle = NSAttributedString(string: "clear done", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: cyanText])
+            c.attributedTitle = NSAttributedString(string: "clear done", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: accentText])
             c.sizeToFit(); views.append(c)
         }
         var y = pad
@@ -5253,15 +5493,15 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         let done = t.done != nil
         let box = Tap(frame: NSRect(x: 0, y: 0, width: 20, height: 20)); box.isBordered = false; box.title = ""
         box.image = NSImage(systemSymbolName: done ? "checkmark.circle.fill" : "circle", accessibilityDescription: done ? "Done" : "Not done")
-        box.contentTintColor = done ? hex("#7ad3a3") : NSColor(white: 1, alpha: 0.7)
+        box.contentTintColor = done ? EdenTheme.success : EdenTheme.secondaryText
         box.identifier = NSUserInterfaceItemIdentifier(t.id); box.target = self; box.action = #selector(toggleTodo(_:))
         let del = Tap(frame: NSRect(x: 0, y: 0, width: 16, height: 20)); del.isBordered = false
-        del.attributedTitle = NSAttributedString(string: "×", attributes: [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor(white: 1, alpha: 0.35)])
+        del.attributedTitle = NSAttributedString(string: "×", attributes: [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: EdenTheme.secondaryText])
         del.identifier = NSUserInterfaceItemIdentifier(t.id); del.target = self; del.action = #selector(deleteTodo(_:)); del.toolTip = "Remove"
-        let age = label(ago(t.done ?? t.added), size: 10, color: NSColor(white: 1, alpha: 0.45), mono: true)
+        let age = label(ago(t.done ?? t.added), size: 10, color: EdenTheme.secondaryText, mono: true)
         let tw = width - 26 - age.frame.width - 6 - 18
-        let tl = label(t.text, size: 13, color: NSColor(white: 1, alpha: done ? 0.45 : 0.92), wrap: tw)
-        if done { tl.attributedStringValue = NSAttributedString(string: t.text, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor(white: 1, alpha: 0.45), .strikethroughStyle: NSUnderlineStyle.single.rawValue]) }
+        let tl = label(t.text, size: 13, color: done ? EdenTheme.secondaryText : EdenTheme.text, wrap: tw)
+        if done { tl.attributedStringValue = NSAttributedString(string: t.text, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: EdenTheme.secondaryText, .strikethroughStyle: NSUnderlineStyle.single.rawValue]) }
         let h = max(20, tl.frame.height)
         let v = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h))
         box.frame.origin = NSPoint(x: 0, y: h - 20)
@@ -5303,13 +5543,13 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         box.subviews.forEach { $0.removeFromSuperview() }
         let W: CGFloat = 360, pad: CGFloat = 14, iw = W - 2 - pad * 2
         var views: [NSView] = [
-            label("Eden · claude is asking" + (qs.count > 1 ? "   \(qIndex + 1) of \(qs.count)" : ""), size: 10, weight: .medium, color: cyanText, mono: true),
+            label("Eden · claude is asking" + (qs.count > 1 ? "   \(qIndex + 1) of \(qs.count)" : ""), size: 10, weight: .medium, color: accentText, mono: true),
             label(q["question"] as? String ?? "", size: 13.5, weight: .semibold, wrap: iw)]
-        if multi { views.append(label("This one takes several picks, so answer it in Terminal.", size: 11.5, color: NSColor(white: 1, alpha: 0.6), wrap: iw)) }
+        if multi { views.append(label("This one takes several picks, so answer it in Terminal.", size: 11.5, color: EdenTheme.secondaryText, wrap: iw)) }
         for (i, o) in opts.enumerated() { views.append(option(o["label"] as? String ?? "", o["description"] as? String ?? "", width: iw, tag: i, enabled: !multi)) }
         if !multi { views.append(option("Other…", "Type your own answer in Eden", width: iw, tag: 1000, enabled: true)) }
         let go = Tap(frame: .zero); go.isBordered = false; go.target = self; go.action = #selector(openQuestionTab)
-        go.attributedTitle = NSAttributedString(string: "Open in Terminal ↗", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: cyanText])
+        go.attributedTitle = NSAttributedString(string: "Open in Terminal ↗", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: accentText])
         go.sizeToFit(); views.append(go)
         var y = pad
         for v in views.reversed() { v.frame.origin = NSPoint(x: pad, y: y); box.addSubview(v); y += v.frame.height + 7 }
@@ -5323,11 +5563,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
 
     func option(_ title: String, _ desc: String, width: CGFloat, tag: Int, enabled: Bool) -> NSView {
         let tl = label(title, size: 13, weight: .semibold, wrap: width - 20)
-        let dl = desc.isEmpty ? nil : label(desc, size: 11.5, color: NSColor(white: 1, alpha: 0.62), wrap: width - 20)
+        let dl = desc.isEmpty ? nil : label(desc, size: 11.5, color: EdenTheme.secondaryText, wrap: width - 20)
         let h = 8 + tl.frame.height + (dl.map { 2 + $0.frame.height } ?? 0) + 8
         let v = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h)); v.wantsLayer = true
-        v.layer?.cornerRadius = 10; v.layer?.backgroundColor = NSColor(white: 1, alpha: enabled ? 0.09 : 0.04).cgColor
-        v.layer?.borderWidth = 1; v.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
+        v.layer?.cornerRadius = 10; v.layer?.backgroundColor = (enabled ? EdenTheme.selected : EdenTheme.surface).cgColor
+        v.layer?.borderWidth = 1; v.layer?.borderColor = (enabled ? EdenTheme.primary : EdenTheme.surface).cgColor
         var y: CGFloat = 8
         if let d = dl { d.frame.origin = NSPoint(x: 10, y: y); v.addSubview(d); y += d.frame.height + 2 }
         tl.frame.origin = NSPoint(x: 10, y: y); v.addSubview(tl)
@@ -5400,11 +5640,11 @@ final class Bar: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSSearchF
         if t.isEmpty { if let p = nowPanel, p.isVisible { NSAnimationContext.runAnimationGroup({ c in c.duration = 0.2; p.animator().alphaValue = 0 }, completionHandler: { [weak self] in p.orderOut(nil); self?.repositionPanels() }) }; return }
         if nowPanel == nil {
             let (p, box) = glassPanel(NSSize(width: 200, height: 24), radius: 12)
-            let l = NSTextField(labelWithString: ""); l.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium); l.textColor = NSColor(white: 1, alpha: 0.82)
+            let l = NSTextField(labelWithString: ""); l.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium); l.textColor = EdenTheme.secondaryText
             l.lineBreakMode = .byTruncatingTail; box.addSubview(l); nowPanel = p; nowLabel = l
         }
         guard let p = nowPanel, let l = nowLabel else { return }
-        l.attributedStringValue = NSAttributedString(string: "› " + t, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .medium), .foregroundColor: NSColor(white: 1, alpha: 0.82)])
+        l.attributedStringValue = NSAttributedString(string: "› " + t, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .medium), .foregroundColor: EdenTheme.secondaryText])
         l.sizeToFit()
         let w = min(420, l.frame.width + 24)
         l.frame = NSRect(x: 11, y: (24 - 2 - l.frame.height) / 2, width: w - 24, height: l.frame.height)

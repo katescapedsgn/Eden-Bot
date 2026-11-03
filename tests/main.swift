@@ -1,8 +1,82 @@
 import Foundation
+import Cocoa
 
 func check(_ condition: @autoclosure () -> Bool, _ message: String) {
     guard condition() else { fputs("FAIL: \(message)\n", stderr); exit(1) }
 }
+
+func contrast(_ first: NSColor, _ second: NSColor) -> Double {
+    func luminance(_ color: NSColor) -> Double {
+        let value = color.usingColorSpace(.sRGB)!
+        let channels = [value.redComponent, value.greenComponent, value.blueComponent].map { channel -> Double in
+            let x = Double(channel)
+            return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+    }
+    let a = luminance(first), b = luminance(second)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+}
+
+check(contrast(EdenTheme.text, EdenTheme.background) >= 4.5 &&
+      contrast(EdenTheme.text, EdenTheme.surface) >= 4.5 &&
+      contrast(EdenTheme.text, EdenTheme.selected) >= 4.5 &&
+      contrast(EdenTheme.text, EdenTheme.thought) >= 4.5 &&
+      contrast(EdenTheme.secondaryText, EdenTheme.surface) >= 4.5 &&
+      contrast(EdenTheme.pressed, EdenTheme.surface) >= 3 &&
+      contrast(EdenTheme.primary, EdenTheme.surface) >= 3 &&
+      contrast(EdenTheme.primary, EdenTheme.background) >= 3 &&
+      contrast(EdenTheme.focus, EdenTheme.selected) >= 3 &&
+      contrast(EdenTheme.primary, EdenTheme.background) >= 4.5 &&
+      contrast(EdenTheme.error, EdenTheme.surface) >= 4.5 &&
+      contrast(EdenTheme.success, EdenTheme.surface) >= 4.5,
+      "purple theme text and semantic feedback retain readable dark contrast")
+
+func sameRGB(_ first: NSColor, _ second: NSColor) -> Bool {
+    guard let a = first.usingColorSpace(.sRGB), let b = second.usingColorSpace(.sRGB) else { return false }
+    return abs(a.redComponent - b.redComponent) < 0.001 &&
+        abs(a.greenComponent - b.greenComponent) < 0.001 &&
+        abs(a.blueComponent - b.blueComponent) < 0.001
+}
+
+let quickContrastButton = EdenButton(title: "Open", target: nil, action: nil)
+quickContrastButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Open")
+quickContrastButton.imagePosition = .imageLeft
+quickContrastButton.compactQuickAction = true
+quickContrastButton.frame = NSRect(x: 0, y: 0, width: QuickChatLayout.buttonSize.width,
+                                   height: QuickChatLayout.buttonSize.height)
+EdenTheme.styleButton(quickContrastButton)
+let quickContentRects = quickContrastButton.contentRects()
+check(QuickChatLayout.buttonSize == NSSize(width: 96, height: 46) &&
+      QuickChatLayout.buttonColumnGap == 8 &&
+      quickContentRects.icon != nil &&
+      abs(quickContentRects.title.minX - quickContentRects.icon!.maxX - 8) < 0.01 &&
+      abs((quickContentRects.icon!.minX + quickContentRects.title.maxX) / 2 -
+          quickContrastButton.bounds.midX) < 0.01 &&
+      quickContrastButton.layer?.borderWidth == 0,
+      "Quick Action icon and title share a centred compact layout without a resting outline")
+let buttonTitleColor = quickContrastButton.attributedTitle.attribute(.foregroundColor, at: 0,
+    effectiveRange: nil) as? NSColor
+let alternateTitleColor = quickContrastButton.attributedAlternateTitle.attribute(.foregroundColor, at: 0,
+    effectiveRange: nil) as? NSColor
+check(buttonTitleColor.map { sameRGB($0, EdenTheme.text) } == true &&
+      alternateTitleColor.map { sameRGB($0, EdenTheme.text) } == true &&
+      quickContrastButton.image?.isTemplate == true &&
+      quickContrastButton.contentTintColor.map { sameRGB($0, EdenTheme.text) } == true,
+      "Quick Action title and SF Symbol have explicit light AppKit colours")
+quickContrastButton.isEnabled = false
+check(quickContrastButton.contentTintColor.map { sameRGB($0, EdenTheme.secondaryText) } == true &&
+      quickContrastButton.layer?.backgroundColor.flatMap(NSColor.init(cgColor:))
+        .map { sameRGB($0, EdenTheme.surface) } == true,
+      "disabled Quick Action keeps a readable icon and muted surface")
+let themedSearch = NSSearchField(frame: NSRect(x: 0, y: 0, width: 180, height: 26))
+themedSearch.placeholderString = "Search apps"
+EdenTheme.styleEntry(themedSearch)
+let placeholderColor = themedSearch.placeholderAttributedString?.attribute(.foregroundColor, at: 0,
+    effectiveRange: nil) as? NSColor
+check(sameRGB(themedSearch.textColor ?? .black, EdenTheme.text) &&
+      placeholderColor.map { sameRGB($0, EdenTheme.secondaryText) } == true,
+      "search text and placeholder use explicit contrasting colours")
 
 let idleResource = URL(fileURLWithPath: ProcessInfo.processInfo.environment["EDEN_DIALOGUE_SOURCE"] ?? "")
 guard let idleDialogue = IdleThoughtsDialogue.load(from: idleResource) else {
